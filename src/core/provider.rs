@@ -1,3 +1,4 @@
+mod client;
 use std::{collections::BTreeMap, error::Error, future::Future, time::Duration};
 
 use serde::Serialize;
