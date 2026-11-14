@@ -42,7 +42,13 @@ impl Engine {
         let mut decisions = Vec::with_capacity(messages.len());
         for (index, message) in messages.iter().enumerate() {
             let state = state(&windows, &messages, index);
-            decisions.push(self.decisions.decide(tenant, message, &state).await?);
+            match self.decisions.decide(tenant, message, &state).await {
+                Ok(decision) => decisions.push(decision),
+                Err(err) => {
+                    self.decisions.mark_failed(tenant, message).await?;
+                    return Err(err);
+                }
+            }
         }
         Ok(decisions)
     }
@@ -69,8 +75,18 @@ impl Engine {
     async fn finish(&self, tenant: &str, messages: &[IncomingMessage], windows: &RoomWindows) {
         for (index, message) in messages.iter().enumerate() {
             let state = state(windows, messages, index);
-            if let Err(err) = self.deliver_decision(tenant, message, &state).await {
-                log_background(&err);
+            match self.decisions.decide(tenant, message, &state).await {
+                Ok(decision) => {
+                    if let Err(err) = self.webhooks.deliver_decision(tenant, &decision).await {
+                        log_background(&err);
+                    }
+                }
+                Err(err) => {
+                    if let Err(mark_err) = self.decisions.mark_failed(tenant, message).await {
+                        log_background(&mark_err);
+                    }
+                    log_background(&err);
+                }
             }
         }
     }
@@ -99,16 +115,6 @@ impl Engine {
             self.messages.upsert(tenant, message).await?;
         }
         Ok(())
-    }
-
-    async fn deliver_decision(
-        &self,
-        tenant: &str,
-        message: &IncomingMessage,
-        state: &str,
-    ) -> Result<(), AppError> {
-        let decision = self.decisions.decide(tenant, message, state).await?;
-        self.webhooks.deliver_decision(tenant, &decision).await
     }
 }
 

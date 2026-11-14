@@ -17,7 +17,6 @@ CREATE TABLE decisions (
     message_id TEXT NOT NULL,
     status TEXT NOT NULL,
     action TEXT,
-    decided_by TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, message_id)
 );

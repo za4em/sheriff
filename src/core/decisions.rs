@@ -9,12 +9,15 @@ use super::messages::IncomingMessage;
 use super::provider::{DecisionProvider, Fault, Probabilities, Provider, Question, Questions};
 use crate::error::AppError;
 
+pub(crate) type CategoryScores = BTreeMap<Category, f64>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub(crate) enum Status {
     Pending,
     Ready,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -101,17 +104,6 @@ impl Category {
     }
 }
 
-pub(crate) type CategoryScores = BTreeMap<Category, f64>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
-pub(crate) enum DecidedBy {
-    Rules,
-    Model,
-    Fallback,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub(crate) struct Decision {
     pub(crate) message_id: String,
@@ -119,7 +111,6 @@ pub(crate) struct Decision {
     pub(crate) action: Option<Action>,
     #[sqlx(json(nullable))]
     pub(crate) categories: Option<CategoryScores>,
-    pub(crate) decided_by: Option<DecidedBy>,
 }
 
 #[derive(Clone)]
@@ -158,7 +149,6 @@ impl Decisions {
             status: Status::Ready,
             action: Some(chosen),
             categories: Some(categories),
-            decided_by: Some(DecidedBy::Model),
         })
     }
 
@@ -168,6 +158,14 @@ impl Decisions {
         message: &IncomingMessage,
     ) -> Result<(), AppError> {
         repository::mark_pending(&self.pool, tenant, message).await
+    }
+
+    pub(crate) async fn mark_failed(
+        &self,
+        tenant: &str,
+        message: &IncomingMessage,
+    ) -> Result<(), AppError> {
+        repository::mark_failed(&self.pool, tenant, message).await
     }
 
     pub(crate) async fn list(
@@ -332,21 +330,22 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_decision_has_no_verdict() {
-        let decision = Decision {
-            message_id: "m1".to_owned(),
-            status: Status::Pending,
-            action: None,
-            categories: None,
-            decided_by: None,
-        };
-        let value = serde_json::to_value(&decision).unwrap();
-        assert_eq!(value["status"], "pending");
-        assert!(value["action"].is_null());
-        assert!(value["categories"].is_null());
-        assert!(value["decided_by"].is_null());
-        assert!(value.get("triggered").is_none());
-        assert!(value.get("latency_ms").is_none());
+    fn an_unfinished_decision_has_no_verdict() {
+        for (status, name) in [(Status::Pending, "pending"), (Status::Failed, "failed")] {
+            let decision = Decision {
+                message_id: "m1".to_owned(),
+                status,
+                action: None,
+                categories: None,
+            };
+            let value = serde_json::to_value(&decision).unwrap();
+            assert_eq!(value["status"], name);
+            assert!(value["action"].is_null());
+            assert!(value["categories"].is_null());
+            assert!(value.get("decided_by").is_none());
+            assert!(value.get("triggered").is_none());
+            assert!(value.get("latency_ms").is_none());
+        }
     }
 
     #[test]

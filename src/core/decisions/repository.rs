@@ -1,6 +1,6 @@
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::{Action, CategoryScores, DecidedBy, Decision, Status};
+use super::{Action, CategoryScores, Decision, Status};
 use crate::core::messages::IncomingMessage;
 use crate::error::{AppError, database};
 
@@ -9,31 +9,57 @@ pub(super) async fn mark_pending(
     tenant: &str,
     message: &IncomingMessage,
 ) -> Result<(), AppError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|err| database("marking a decision pending", err))?;
+    mark(
+        pool,
+        tenant,
+        message,
+        Status::Pending,
+        "marking a decision pending",
+    )
+    .await
+}
+
+pub(super) async fn mark_failed(
+    pool: &PgPool,
+    tenant: &str,
+    message: &IncomingMessage,
+) -> Result<(), AppError> {
+    mark(
+        pool,
+        tenant,
+        message,
+        Status::Failed,
+        "marking a decision failed",
+    )
+    .await
+}
+
+async fn mark(
+    pool: &PgPool,
+    tenant: &str,
+    message: &IncomingMessage,
+    status: Status,
+    action: &'static str,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(|err| database(action, err))?;
     sqlx::query(
         r#"
-        INSERT INTO decisions (tenant_id, message_id, status, action, decided_by)
-        VALUES ($1, $2, $3, NULL, NULL)
+        INSERT INTO decisions (tenant_id, message_id, status, action)
+        VALUES ($1, $2, $3, NULL)
         ON CONFLICT (tenant_id, message_id) DO UPDATE
         SET status = EXCLUDED.status,
             action = NULL,
-            decided_by = NULL,
             updated_at = now()
         "#,
     )
     .bind(tenant)
     .bind(&message.message_id)
-    .bind(Status::Pending)
+    .bind(status)
     .execute(&mut *tx)
     .await
-    .map_err(|err| database("marking a decision pending", err))?;
+    .map_err(|err| database(action, err))?;
     delete_scores(&mut tx, tenant, &message.message_id).await?;
-    tx.commit()
-        .await
-        .map_err(|err| database("marking a decision pending", err))?;
+    tx.commit().await.map_err(|err| database(action, err))?;
     Ok(())
 }
 
@@ -50,12 +76,11 @@ pub(super) async fn write_ready(
         .map_err(|err| database("saving a decision", err))?;
     sqlx::query(
         r#"
-        INSERT INTO decisions (tenant_id, message_id, status, action, decided_by)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO decisions (tenant_id, message_id, status, action)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (tenant_id, message_id) DO UPDATE
         SET status = EXCLUDED.status,
             action = EXCLUDED.action,
-            decided_by = EXCLUDED.decided_by,
             updated_at = now()
         "#,
     )
@@ -63,7 +88,6 @@ pub(super) async fn write_ready(
     .bind(&message.message_id)
     .bind(Status::Ready)
     .bind(chosen)
-    .bind(DecidedBy::Model)
     .execute(&mut *tx)
     .await
     .map_err(|err| database("saving a decision", err))?;
@@ -90,8 +114,7 @@ pub(super) async fn list(
         SELECT d.message_id,
                d.status,
                d.action,
-               scores.categories,
-               d.decided_by
+               scores.categories
         FROM decisions d
         JOIN messages m
           ON m.tenant_id = d.tenant_id
