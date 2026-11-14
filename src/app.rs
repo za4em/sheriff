@@ -1,0 +1,29 @@
+use std::error::Error;
+
+use sqlx::postgres::PgPoolOptions;
+
+use crate::{
+    config::Config,
+    core::{Engine, provider::Provider},
+};
+
+#[derive(Clone)]
+pub struct App {
+    pub(crate) engine: Engine,
+    pub(crate) api_key: String,
+}
+
+impl App {
+    pub async fn connect(config: Config) -> Result<Self, Box<dyn Error>> {
+        let pool = PgPoolOptions::new()
+            .max_connections(config.database.pool_size)
+            .connect(&config.database.url)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        let provider = Provider::from_config(config.provider)?;
+        Ok(Self {
+            engine: Engine::new(pool, provider)?,
+            api_key: config.api_key,
+        })
+    }
+}
