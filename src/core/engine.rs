@@ -171,6 +171,7 @@ fn log_background(err: &AppError) {
         }
         AppError::Unauthorized
         | AppError::InvalidMessage
+        | AppError::UnknownCategory
         | AppError::WebhookUrlRequired
         | AppError::WebhookUrlInvalid
         | AppError::WebhookEncode => tracing::error!("background submit failed"),

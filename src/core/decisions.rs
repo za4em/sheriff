@@ -1,9 +1,6 @@
 mod repository;
 
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -98,6 +95,13 @@ impl Category {
             other => panic!("a category serializes as a string, got {other:?}"),
         }
     }
+
+    fn parse(name: &str) -> Result<Self, AppError> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.key() == name)
+            .ok_or(AppError::UnknownCategory)
+    }
 }
 
 pub(crate) type CategoryScores = BTreeMap<Category, f64>;
@@ -118,10 +122,7 @@ pub(crate) struct Decision {
     pub(crate) action: Option<Action>,
     #[sqlx(json(nullable))]
     pub(crate) categories: Option<CategoryScores>,
-    #[sqlx(json)]
-    pub(crate) triggered: Vec<Category>,
     pub(crate) decided_by: Option<DecidedBy>,
-    pub(crate) latency_ms: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -141,35 +142,21 @@ impl Decisions {
         message: &IncomingMessage,
         state: &str,
     ) -> Result<Decision, AppError> {
-        let started = Instant::now();
         let questions = message_questions();
         let probabilities = self
             .provider
             .decide(state, &questions)
             .await
             .map_err(AppError::Provider)?;
-        let elapsed = latency_ms(started.elapsed());
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
-        let hits = triggered(&categories);
-        let chosen = action(&hits);
-        repository::write_ready(
-            &self.pool,
-            tenant,
-            message,
-            chosen,
-            &categories,
-            &hits,
-            elapsed,
-        )
-        .await?;
+        let chosen = action(&hits(&categories));
+        repository::write_ready(&self.pool, tenant, message, chosen, &categories).await?;
         Ok(Decision {
             message_id: message.message_id.clone(),
             status: Status::Ready,
             action: Some(chosen),
             categories: Some(categories),
-            triggered: hits,
             decided_by: Some(DecidedBy::Model),
-            latency_ms: Some(elapsed),
         })
     }
 
@@ -188,11 +175,23 @@ impl Decisions {
         ids: &[String],
         user_id: Option<&str>,
         after: Option<i64>,
+        category: Option<&str>,
     ) -> Result<Vec<Decision>, AppError> {
+        let category = category.map(Category::parse).transpose()?;
         if room.trim().is_empty() {
             return Ok(Vec::new());
         }
-        repository::list(&self.pool, tenant, room, ids, user_id, after).await
+        repository::list(
+            &self.pool,
+            tenant,
+            room,
+            ids,
+            user_id,
+            after,
+            category.map(Category::key),
+            THRESHOLD,
+        )
+        .await
     }
 }
 
@@ -216,27 +215,23 @@ fn category_scores(probabilities: &Probabilities) -> Result<CategoryScores, Faul
     Ok(scores)
 }
 
-fn triggered(scores: &CategoryScores) -> Vec<Category> {
+fn hits(scores: &CategoryScores) -> Vec<Category> {
     Category::ALL
         .into_iter()
         .filter(|category| scores[category] >= THRESHOLD)
         .collect()
 }
 
-fn action(triggered: &[Category]) -> Action {
-    if triggered.is_empty() {
+fn action(hits: &[Category]) -> Action {
+    if hits.is_empty() {
         Action::Allow
-    } else if triggered.contains(&Category::Grooming) {
+    } else if hits.contains(&Category::Grooming) {
         Action::Escalate
-    } else if triggered.len() == 1 && triggered[0] == Category::Spam {
+    } else if hits.len() == 1 && hits[0] == Category::Spam {
         Action::Warn
     } else {
         Action::Hide
     }
-}
-
-fn latency_ms(elapsed: Duration) -> i64 {
-    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -263,21 +258,21 @@ mod tests {
     fn threshold_is_inclusive() {
         let mut scores = scores();
         scores.insert(Category::Insult, THRESHOLD);
-        assert_eq!(action(&triggered(&scores)), Action::Hide);
+        assert_eq!(action(&hits(&scores)), Action::Hide);
         scores.insert(Category::Insult, THRESHOLD - 0.01);
-        assert_eq!(action(&triggered(&scores)), Action::Allow);
+        assert_eq!(action(&hits(&scores)), Action::Allow);
     }
 
     #[test]
     fn spam_alone_warns_and_spam_with_an_insult_hides() {
         let mut scores = scores();
         scores.insert(Category::Spam, THRESHOLD);
-        let spam = triggered(&scores);
+        let spam = hits(&scores);
         assert_eq!(spam, vec![Category::Spam]);
         assert_eq!(action(&spam), Action::Warn);
 
         scores.insert(Category::Insult, THRESHOLD);
-        let both = triggered(&scores);
+        let both = hits(&scores);
         assert_eq!(both, vec![Category::Insult, Category::Spam]);
         assert_eq!(action(&both), Action::Hide);
     }
@@ -286,15 +281,15 @@ mod tests {
     fn grooming_escalates_even_when_another_category_also_hits() {
         let mut scores = scores();
         scores.insert(Category::Grooming, THRESHOLD);
-        assert_eq!(action(&triggered(&scores)), Action::Escalate);
+        assert_eq!(action(&hits(&scores)), Action::Escalate);
 
         scores.insert(Category::Insult, THRESHOLD);
-        let both = triggered(&scores);
+        let both = hits(&scores);
         assert_eq!(both, vec![Category::Insult, Category::Grooming]);
         assert_eq!(action(&both), Action::Escalate);
 
         scores.insert(Category::Grooming, 0.0);
-        assert_eq!(action(&triggered(&scores)), Action::Hide);
+        assert_eq!(action(&hits(&scores)), Action::Hide);
     }
 
     #[test]
@@ -324,16 +319,23 @@ mod tests {
             status: Status::Pending,
             action: None,
             categories: None,
-            triggered: Vec::new(),
             decided_by: None,
-            latency_ms: None,
         };
         let value = serde_json::to_value(&decision).unwrap();
         assert_eq!(value["status"], "pending");
         assert!(value["action"].is_null());
         assert!(value["categories"].is_null());
-        assert_eq!(value["triggered"], serde_json::json!([]));
         assert!(value["decided_by"].is_null());
-        assert!(value["latency_ms"].is_null());
+        assert!(value.get("triggered").is_none());
+        assert!(value.get("latency_ms").is_none());
+    }
+
+    #[test]
+    fn an_unknown_category_name_is_rejected() {
+        assert!(Category::parse("bullying").is_ok());
+        assert_eq!(
+            Category::parse("harassment").unwrap_err(),
+            AppError::UnknownCategory
+        );
     }
 }

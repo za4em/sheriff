@@ -12,6 +12,7 @@ pub(crate) enum AppError {
     Unauthorized,
     InvalidMessage,
     MessageIncomplete { field: &'static str },
+    UnknownCategory,
     WebhookUrlRequired,
     WebhookUrlInvalid,
     WebhookEncode,
@@ -43,6 +44,7 @@ fn status(err: &AppError) -> StatusCode {
         AppError::Unauthorized => StatusCode::UNAUTHORIZED,
         AppError::InvalidMessage
         | AppError::MessageIncomplete { .. }
+        | AppError::UnknownCategory
         | AppError::WebhookUrlRequired
         | AppError::WebhookUrlInvalid => StatusCode::BAD_REQUEST,
         AppError::WebhookEncode | AppError::Database { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -58,6 +60,9 @@ fn client_message(err: &AppError) -> String {
         AppError::InvalidMessage => "Send a JSON array of messages.".to_owned(),
         AppError::MessageIncomplete { field } => {
             format!("A message needs a non-empty {field}.")
+        }
+        AppError::UnknownCategory => {
+            "A category must be insult, bullying, grooming, hate, threat, scam, illegal_activity, doxxing, or spam.".to_owned()
         }
         AppError::WebhookUrlRequired => "A webhook URL is required.".to_owned(),
         AppError::WebhookUrlInvalid => {

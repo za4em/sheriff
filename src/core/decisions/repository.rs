@@ -1,6 +1,6 @@
-use sqlx::{PgPool, types::Json};
+use sqlx::{PgPool, Postgres, Transaction};
 
-use super::{Action, Category, CategoryScores, DecidedBy, Decision, Status};
+use super::{Action, CategoryScores, DecidedBy, Decision, Status};
 use crate::core::messages::IncomingMessage;
 use crate::error::{AppError, database};
 
@@ -9,33 +9,31 @@ pub(super) async fn mark_pending(
     tenant: &str,
     message: &IncomingMessage,
 ) -> Result<(), AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|err| database("marking a decision pending", err))?;
     sqlx::query(
         r#"
-        INSERT INTO decisions (
-            tenant_id, message_id, room_id, status,
-            action, categories, triggered, decided_by, latency_ms
-        ) VALUES (
-            $1, $2, $3, $4,
-            NULL, NULL, NULL, NULL, NULL
-        )
+        INSERT INTO decisions (tenant_id, message_id, status, action, decided_by)
+        VALUES ($1, $2, $3, NULL, NULL)
         ON CONFLICT (tenant_id, message_id) DO UPDATE
-        SET room_id = EXCLUDED.room_id,
-            status = EXCLUDED.status,
+        SET status = EXCLUDED.status,
             action = NULL,
-            categories = NULL,
-            triggered = NULL,
             decided_by = NULL,
-            latency_ms = NULL,
             updated_at = now()
         "#,
     )
     .bind(tenant)
     .bind(&message.message_id)
-    .bind(&message.room_id)
     .bind(Status::Pending)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|err| database("marking a decision pending", err))?;
+    delete_scores(&mut tx, tenant, &message.message_id).await?;
+    tx.commit()
+        .await
+        .map_err(|err| database("marking a decision pending", err))?;
     Ok(())
 }
 
@@ -45,41 +43,35 @@ pub(super) async fn write_ready(
     message: &IncomingMessage,
     chosen: Action,
     categories: &CategoryScores,
-    hits: &[Category],
-    elapsed: i64,
 ) -> Result<(), AppError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|err| database("saving a decision", err))?;
     sqlx::query(
         r#"
-        INSERT INTO decisions (
-            tenant_id, message_id, room_id, status,
-            action, categories, triggered, decided_by, latency_ms
-        ) VALUES (
-            $1, $2, $3, $4,
-            $5, $6, $7, $8, $9
-        )
+        INSERT INTO decisions (tenant_id, message_id, status, action, decided_by)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (tenant_id, message_id) DO UPDATE
-        SET room_id = EXCLUDED.room_id,
-            status = EXCLUDED.status,
+        SET status = EXCLUDED.status,
             action = EXCLUDED.action,
-            categories = EXCLUDED.categories,
-            triggered = EXCLUDED.triggered,
             decided_by = EXCLUDED.decided_by,
-            latency_ms = EXCLUDED.latency_ms,
             updated_at = now()
         "#,
     )
     .bind(tenant)
     .bind(&message.message_id)
-    .bind(&message.room_id)
     .bind(Status::Ready)
     .bind(chosen)
-    .bind(Json(categories))
-    .bind(Json(hits))
     .bind(DecidedBy::Model)
-    .bind(elapsed)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|err| database("saving a decision", err))?;
+    delete_scores(&mut tx, tenant, &message.message_id).await?;
+    insert_scores(&mut tx, tenant, &message.message_id, categories).await?;
+    tx.commit()
+        .await
+        .map_err(|err| database("saving a decision", err))?;
     Ok(())
 }
 
@@ -90,25 +82,42 @@ pub(super) async fn list(
     ids: &[String],
     user_id: Option<&str>,
     after: Option<i64>,
+    category: Option<String>,
+    threshold: f64,
 ) -> Result<Vec<Decision>, AppError> {
     sqlx::query_as(
         r#"
         SELECT d.message_id,
                d.status,
                d.action,
-               d.categories,
-               COALESCE(d.triggered, '[]'::jsonb) AS triggered,
-               d.decided_by,
-               d.latency_ms
+               scores.categories,
+               d.decided_by
         FROM decisions d
         JOIN messages m
           ON m.tenant_id = d.tenant_id
          AND m.message_id = d.message_id
+        LEFT JOIN LATERAL (
+            SELECT jsonb_object_agg(s.category, s.score) AS categories
+            FROM decision_scores s
+            WHERE s.tenant_id = d.tenant_id
+              AND s.message_id = d.message_id
+        ) scores ON true
         WHERE d.tenant_id = $1
-          AND d.room_id = $2
+          AND m.room_id = $2
           AND (cardinality($3::text[]) = 0 OR d.message_id = ANY($3::text[]))
           AND ($4::text IS NULL OR m.user_id = $4)
           AND ($5::bigint IS NULL OR m.timestamp > $5)
+          AND (
+            $6::text IS NULL
+            OR EXISTS (
+                SELECT 1
+                FROM decision_scores hit
+                WHERE hit.tenant_id = d.tenant_id
+                  AND hit.message_id = d.message_id
+                  AND hit.category = $6
+                  AND hit.score >= $7
+            )
+          )
         ORDER BY m.timestamp ASC, d.message_id ASC
         "#,
     )
@@ -117,7 +126,58 @@ pub(super) async fn list(
     .bind(ids)
     .bind(user_id)
     .bind(after)
+    .bind(category)
+    .bind(threshold)
     .fetch_all(pool)
     .await
     .map_err(|err| database("listing decisions", err))
+}
+
+async fn delete_scores(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: &str,
+    message_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        DELETE FROM decision_scores
+        WHERE tenant_id = $1
+          AND message_id = $2
+        "#,
+    )
+    .bind(tenant)
+    .bind(message_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|err| database("replacing decision scores", err))?;
+    Ok(())
+}
+
+async fn insert_scores(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: &str,
+    message_id: &str,
+    categories: &CategoryScores,
+) -> Result<(), AppError> {
+    let mut names = Vec::with_capacity(categories.len());
+    let mut scores = Vec::with_capacity(categories.len());
+    for (category, score) in categories {
+        names.push(category.key());
+        scores.push(*score);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO decision_scores (tenant_id, message_id, category, score)
+        SELECT $1, $2, category, score
+        FROM unnest($3::text[], $4::float8[]) AS score_row(category, score)
+        "#,
+    )
+    .bind(tenant)
+    .bind(message_id)
+    .bind(&names)
+    .bind(&scores)
+    .execute(&mut **tx)
+    .await
+    .map_err(|err| database("saving a decision", err))?;
+    Ok(())
 }

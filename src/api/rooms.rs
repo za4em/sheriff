@@ -18,6 +18,7 @@ struct DecisionsQuery {
     id: Vec<String>,
     user_id: Option<String>,
     after: Option<i64>,
+    category: Option<String>,
 }
 
 async fn list_decisions(
@@ -35,6 +36,7 @@ async fn list_decisions(
             &query.id,
             query.user_id.as_deref(),
             query.after,
+            query.category.as_deref(),
         )
         .await?;
     Ok(Json(decisions))

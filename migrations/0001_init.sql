@@ -15,18 +15,22 @@ CREATE INDEX messages_tenant_room_timestamp_idx ON messages (tenant_id, room_id,
 CREATE TABLE decisions (
     tenant_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    room_id TEXT NOT NULL,
     status TEXT NOT NULL,
     action TEXT,
-    categories JSONB,
-    triggered JSONB,
     decided_by TEXT,
-    latency_ms BIGINT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, message_id)
 );
 
-CREATE INDEX decisions_tenant_room_updated_idx ON decisions (tenant_id, room_id, updated_at);
+CREATE TABLE decision_scores (
+    tenant_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    score DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (tenant_id, message_id, category),
+    FOREIGN KEY (tenant_id, message_id)
+        REFERENCES decisions (tenant_id, message_id)
+);
 
 CREATE TABLE webhook_endpoints (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
