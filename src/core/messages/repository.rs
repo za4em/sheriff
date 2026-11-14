@@ -11,7 +11,7 @@ pub(super) async fn upsert(
     sqlx::query(
         r#"
         INSERT INTO messages (
-            tenant_id, message_id, room_id, user_id, text, ts, reply_to, meta
+            tenant_id, message_id, room_id, user_id, text, timestamp, reply_to, meta
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8
         )
@@ -19,7 +19,7 @@ pub(super) async fn upsert(
         SET text = EXCLUDED.text,
             room_id = EXCLUDED.room_id,
             user_id = EXCLUDED.user_id,
-            ts = EXCLUDED.ts,
+            timestamp = EXCLUDED.timestamp,
             reply_to = EXCLUDED.reply_to,
             meta = EXCLUDED.meta
         "#,
@@ -29,7 +29,7 @@ pub(super) async fn upsert(
     .bind(&message.room_id)
     .bind(&message.user_id)
     .bind(&message.text)
-    .bind(message.ts)
+    .bind(message.timestamp)
     .bind(&message.reply_to)
     .bind(&message.meta)
     .execute(pool)
@@ -47,12 +47,12 @@ pub(super) async fn window(
 ) -> Result<Vec<IncomingMessage>, AppError> {
     sqlx::query_as(
         r#"
-        SELECT message_id, room_id, user_id, text, ts, reply_to, meta
+        SELECT message_id, room_id, user_id, text, timestamp, reply_to, meta
         FROM messages
         WHERE tenant_id = $1
           AND room_id = $2
           AND message_id <> ALL($4::text[])
-        ORDER BY ts DESC
+        ORDER BY timestamp DESC
         LIMIT $3
         "#,
     )

@@ -18,7 +18,7 @@ pub(crate) struct IncomingMessage {
     pub(crate) room_id: String,
     pub(crate) user_id: String,
     pub(crate) text: String,
-    pub(crate) ts: i64,
+    pub(crate) timestamp: i64,
     #[serde(default)]
     pub(crate) reply_to: Option<String>,
     #[serde(default = "empty_object")]
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     fn missing_reply_and_meta_default() {
         let messages: Vec<IncomingMessage> = serde_json::from_str(
-            r#"[{"message_id":"m1","room_id":"r","user_id":"u","text":"hi","ts":1}]"#,
+            r#"[{"message_id":"m1","room_id":"r","user_id":"u","text":"hi","timestamp":1}]"#,
         )
         .unwrap();
         assert_eq!(messages.len(), 1);

@@ -4,13 +4,13 @@ CREATE TABLE messages (
     room_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     text TEXT NOT NULL,
-    ts BIGINT NOT NULL,
+    timestamp BIGINT NOT NULL,
     reply_to TEXT,
     meta JSONB NOT NULL DEFAULT '{}',
     PRIMARY KEY (tenant_id, message_id)
 );
 
-CREATE INDEX messages_tenant_room_ts_idx ON messages (tenant_id, room_id, ts DESC);
+CREATE INDEX messages_tenant_room_timestamp_idx ON messages (tenant_id, room_id, timestamp DESC);
 
 CREATE TABLE decisions (
     tenant_id TEXT NOT NULL,

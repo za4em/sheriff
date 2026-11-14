@@ -89,7 +89,7 @@ pub(super) async fn list(
     room: &str,
     ids: &[String],
     user_id: Option<&str>,
-    after_ts: Option<i64>,
+    after: Option<i64>,
 ) -> Result<Vec<Decision>, AppError> {
     sqlx::query_as(
         r#"
@@ -108,15 +108,15 @@ pub(super) async fn list(
           AND d.room_id = $2
           AND (cardinality($3::text[]) = 0 OR d.message_id = ANY($3::text[]))
           AND ($4::text IS NULL OR m.user_id = $4)
-          AND ($5::bigint IS NULL OR m.ts > $5)
-        ORDER BY m.ts ASC, d.message_id ASC
+          AND ($5::bigint IS NULL OR m.timestamp > $5)
+        ORDER BY m.timestamp ASC, d.message_id ASC
         "#,
     )
     .bind(tenant)
     .bind(room)
     .bind(ids)
     .bind(user_id)
-    .bind(after_ts)
+    .bind(after)
     .fetch_all(pool)
     .await
     .map_err(|err| database("listing decisions", err))

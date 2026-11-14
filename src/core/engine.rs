@@ -110,7 +110,7 @@ impl Engine {
             .any(|existing| existing.message_id == message.message_id)
         {
             window.push(message.clone());
-            window.sort_by_key(|existing| existing.ts);
+            window.sort_by_key(|existing| existing.timestamp);
         }
         Ok(lines(&window, &message.message_id))
     }
@@ -188,7 +188,7 @@ mod tests {
             room_id: room_id.to_owned(),
             user_id: user_id.to_owned(),
             text: text.to_owned(),
-            ts: 1,
+            timestamp: 1,
             reply_to: None,
             meta: json!({}),
         }

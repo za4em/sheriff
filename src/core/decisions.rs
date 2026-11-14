@@ -187,12 +187,12 @@ impl Decisions {
         room: &str,
         ids: &[String],
         user_id: Option<&str>,
-        after_ts: Option<i64>,
+        after: Option<i64>,
     ) -> Result<Vec<Decision>, AppError> {
         if room.trim().is_empty() {
             return Ok(Vec::new());
         }
-        repository::list(&self.pool, tenant, room, ids, user_id, after_ts).await
+        repository::list(&self.pool, tenant, room, ids, user_id, after).await
     }
 }
 
