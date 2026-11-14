@@ -7,6 +7,7 @@ pub struct Config {
     pub(crate) database: DatabaseConfig,
     pub(crate) provider: ProviderConfig,
     pub(crate) api_key: String,
+    pub(crate) window: i64,
 }
 
 pub struct ServerConfig {
@@ -30,6 +31,7 @@ impl Config {
             },
             provider: provider()?,
             api_key: required("SHERIFF_API_KEY")?,
+            window: window()?,
         })
     }
 }
@@ -54,6 +56,17 @@ fn provider() -> Result<ProviderConfig, Box<dyn Error>> {
         }
         other => Err(format!("SHERIFF_PROVIDER must be mock or decision_api, not {other}").into()),
     }
+}
+
+fn window() -> Result<i64, Box<dyn Error>> {
+    let raw = var_or("SHERIFF_WINDOW", "50");
+    let value: i64 = raw
+        .parse()
+        .map_err(|_| "SHERIFF_WINDOW must be a number".to_owned())?;
+    if value <= 0 {
+        return Err("SHERIFF_WINDOW must be greater than 0".into());
+    }
+    Ok(value)
 }
 
 fn concurrency() -> Result<usize, Box<dyn Error>> {

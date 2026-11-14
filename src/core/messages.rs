@@ -6,12 +6,6 @@ use sqlx::PgPool;
 
 use crate::error::AppError;
 
-pub(crate) const WINDOW: i64 = 50;
-
-fn empty_object() -> Value {
-    Value::Object(serde_json::Map::new())
-}
-
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, sqlx::FromRow)]
 pub(crate) struct IncomingMessage {
     pub(crate) message_id: String,
@@ -28,11 +22,12 @@ pub(crate) struct IncomingMessage {
 #[derive(Clone)]
 pub(crate) struct Messages {
     pool: PgPool,
+    window: i64,
 }
 
 impl Messages {
-    pub(crate) fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: PgPool, window: i64) -> Self {
+        Self { pool, window }
     }
 
     pub(crate) async fn upsert(
@@ -48,10 +43,14 @@ impl Messages {
         tenant: &str,
         room: &str,
     ) -> Result<Vec<IncomingMessage>, AppError> {
-        let mut messages = repository::window(&self.pool, tenant, room, WINDOW).await?;
+        let mut messages = repository::window(&self.pool, tenant, room, self.window).await?;
         messages.reverse();
         Ok(messages)
     }
+}
+
+fn empty_object() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 #[cfg(test)]

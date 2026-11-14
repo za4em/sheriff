@@ -18,9 +18,13 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub(crate) fn new(pool: PgPool, provider: Provider) -> Result<Self, reqwest::Error> {
+    pub(crate) fn new(
+        pool: PgPool,
+        provider: Provider,
+        window: i64,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            messages: Messages::new(pool.clone()),
+            messages: Messages::new(pool.clone(), window),
             decisions: Decisions::new(pool.clone(), provider),
             webhooks: Webhooks::new(pool)?,
         })
