@@ -1,3 +1,5 @@
+mod repository;
+
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -122,6 +124,78 @@ pub(crate) struct Decision {
     pub(crate) latency_ms: Option<i64>,
 }
 
+#[derive(Clone)]
+pub(crate) struct Decisions {
+    pool: PgPool,
+    provider: Provider,
+}
+
+impl Decisions {
+    pub(crate) fn new(pool: PgPool, provider: Provider) -> Self {
+        Self { pool, provider }
+    }
+
+    pub(crate) async fn decide(
+        &self,
+        tenant: &str,
+        message: &IncomingMessage,
+        state: &str,
+    ) -> Result<Decision, AppError> {
+        let started = Instant::now();
+        let questions = message_questions();
+        let probabilities = self
+            .provider
+            .decide(state, &questions)
+            .await
+            .map_err(AppError::Provider)?;
+        let elapsed = latency_ms(started.elapsed());
+        let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
+        let hits = triggered(&categories);
+        let chosen = action(&hits);
+        repository::write_ready(
+            &self.pool,
+            tenant,
+            message,
+            chosen,
+            &categories,
+            &hits,
+            elapsed,
+        )
+        .await?;
+        Ok(Decision {
+            message_id: message.message_id.clone(),
+            status: Status::Ready,
+            action: Some(chosen),
+            categories: Some(categories),
+            triggered: hits,
+            decided_by: Some(DecidedBy::Model),
+            latency_ms: Some(elapsed),
+        })
+    }
+
+    pub(crate) async fn mark_pending(
+        &self,
+        tenant: &str,
+        message: &IncomingMessage,
+    ) -> Result<(), AppError> {
+        repository::mark_pending(&self.pool, tenant, message).await
+    }
+
+    pub(crate) async fn list(
+        &self,
+        tenant: &str,
+        room: &str,
+        ids: &[String],
+        user_id: Option<&str>,
+        after_ts: Option<i64>,
+    ) -> Result<Vec<Decision>, AppError> {
+        if room.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        repository::list(&self.pool, tenant, room, ids, user_id, after_ts).await
+    }
+}
+
 fn message_questions() -> Questions {
     Category::ALL
         .into_iter()
@@ -159,6 +233,10 @@ fn action(triggered: &[Category]) -> Action {
     } else {
         Action::Hide
     }
+}
+
+fn latency_ms(elapsed: Duration) -> i64 {
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
