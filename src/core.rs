@@ -1,3 +1,4 @@
+pub(crate) mod category;
 pub(crate) mod decisions;
 pub(crate) mod engine;
 pub(crate) mod messages;

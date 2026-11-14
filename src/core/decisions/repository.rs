@@ -1,6 +1,7 @@
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::{Action, CategoryScores, Decision, Status};
+use super::{CategoryScores, Decision, Status};
+use crate::core::category::Action;
 use crate::core::messages::IncomingMessage;
 use crate::error::{AppError, database};
 
