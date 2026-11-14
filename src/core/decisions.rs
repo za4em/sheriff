@@ -1,0 +1,261 @@
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+use super::messages::IncomingMessage;
+use super::provider::{DecisionProvider, Fault, Probabilities, Provider, Question, Questions};
+use crate::error::AppError;
+
+const THRESHOLD: f64 = 0.8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub(crate) enum Status {
+    Pending,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub(crate) enum Action {
+    Allow,
+    Hide,
+    Warn,
+    Mute,
+    Escalate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Category {
+    Insult,
+    Bullying,
+    Grooming,
+    Hate,
+    Threat,
+    Scam,
+    IllegalActivity,
+    Doxxing,
+    Spam,
+}
+
+impl Category {
+    const ALL: [Self; 9] = [
+        Self::Insult,
+        Self::Bullying,
+        Self::Grooming,
+        Self::Hate,
+        Self::Threat,
+        Self::Scam,
+        Self::IllegalActivity,
+        Self::Doxxing,
+        Self::Spam,
+    ];
+
+    fn question(self) -> &'static str {
+        match self {
+            Self::Insult => {
+                "Is the message marked [this] a direct attack on a person (name-calling or humiliation)? Profanity with no target does not count. Other lines are context."
+            }
+            Self::Bullying => {
+                "Given this chat, is the author of the message marked [this] bullying someone? A single insult does not count. Other lines are context."
+            }
+            Self::Grooming => {
+                "Given this chat, is the author of the message marked [this] grooming someone (trust, secrecy, gifts, other apps, or photos with a likely minor)? One friendly message does not count. Other lines are context."
+            }
+            Self::Hate => {
+                "Does the message marked [this] attack someone based on a protected group (ethnicity, religion, gender, orientation, or disability)? Other lines are context."
+            }
+            Self::Threat => {
+                "Does the message marked [this] threaten violence or harm, including finding someone or swatting? Other lines are context."
+            }
+            Self::Scam => {
+                "Is the message marked [this] a phishing link, fake giveaway, or a request for credentials or codes? Other lines are context."
+            }
+            Self::IllegalActivity => {
+                "Is the message marked [this] selling or soliciting drugs, weapons, stolen accounts, cheats, fake documents, or a call to commit a crime? Other lines are context."
+            }
+            Self::Doxxing => {
+                "Does the message marked [this] share someone else's personal information, or threaten to? Other lines are context."
+            }
+            Self::Spam => {
+                "Is the message marked [this] advertising, self-promotion, a referral link, or an invite to another server? Other lines are context."
+            }
+        }
+    }
+
+    fn key(self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(name)) => name,
+            other => panic!("a category serializes as a string, got {other:?}"),
+        }
+    }
+}
+
+pub(crate) type CategoryScores = BTreeMap<Category, f64>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub(crate) enum DecidedBy {
+    Rules,
+    Model,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub(crate) struct Decision {
+    pub(crate) message_id: String,
+    pub(crate) status: Status,
+    pub(crate) action: Option<Action>,
+    #[sqlx(json(nullable))]
+    pub(crate) categories: Option<CategoryScores>,
+    #[sqlx(json)]
+    pub(crate) triggered: Vec<Category>,
+    pub(crate) decided_by: Option<DecidedBy>,
+    pub(crate) latency_ms: Option<i64>,
+}
+
+fn message_questions() -> Questions {
+    Category::ALL
+        .into_iter()
+        .map(|category| (category.key(), Question::score(category.question())))
+        .collect()
+}
+
+fn category_scores(probabilities: &Probabilities) -> Result<CategoryScores, Fault> {
+    let mut scores = CategoryScores::new();
+    for category in Category::ALL {
+        let key = category.key();
+        let Some(score) = probabilities.get(&key).copied() else {
+            tracing::error!(category = %key, "decision scores were missing a category");
+            return Err(Fault::InvalidResponse);
+        };
+        scores.insert(category, score);
+    }
+    Ok(scores)
+}
+
+fn triggered(scores: &CategoryScores) -> Vec<Category> {
+    Category::ALL
+        .into_iter()
+        .filter(|category| scores[category] >= THRESHOLD)
+        .collect()
+}
+
+fn action(triggered: &[Category]) -> Action {
+    if triggered.is_empty() {
+        Action::Allow
+    } else if triggered.contains(&Category::Grooming) {
+        Action::Escalate
+    } else if triggered.len() == 1 && triggered[0] == Category::Spam {
+        Action::Warn
+    } else {
+        Action::Hide
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scores() -> CategoryScores {
+        Category::ALL
+            .into_iter()
+            .map(|category| (category, 0.0))
+            .collect()
+    }
+
+    #[test]
+    fn each_category_is_one_score_question() {
+        let questions = message_questions();
+        assert_eq!(questions.len(), Category::ALL.len());
+        let insult = serde_json::to_value(&questions[&Category::Insult.key()]).unwrap();
+        assert_eq!(insult["type"], "score");
+        assert_eq!(insult["instructions"], Category::Insult.question());
+    }
+
+    #[test]
+    fn threshold_is_inclusive() {
+        let mut scores = scores();
+        scores.insert(Category::Insult, THRESHOLD);
+        assert_eq!(action(&triggered(&scores)), Action::Hide);
+        scores.insert(Category::Insult, THRESHOLD - 0.01);
+        assert_eq!(action(&triggered(&scores)), Action::Allow);
+    }
+
+    #[test]
+    fn spam_alone_warns_and_spam_with_an_insult_hides() {
+        let mut scores = scores();
+        scores.insert(Category::Spam, THRESHOLD);
+        let spam = triggered(&scores);
+        assert_eq!(spam, vec![Category::Spam]);
+        assert_eq!(action(&spam), Action::Warn);
+
+        scores.insert(Category::Insult, THRESHOLD);
+        let both = triggered(&scores);
+        assert_eq!(both, vec![Category::Insult, Category::Spam]);
+        assert_eq!(action(&both), Action::Hide);
+    }
+
+    #[test]
+    fn grooming_escalates_even_when_another_category_also_hits() {
+        let mut scores = scores();
+        scores.insert(Category::Grooming, THRESHOLD);
+        assert_eq!(action(&triggered(&scores)), Action::Escalate);
+
+        scores.insert(Category::Insult, THRESHOLD);
+        let both = triggered(&scores);
+        assert_eq!(both, vec![Category::Insult, Category::Grooming]);
+        assert_eq!(action(&both), Action::Escalate);
+
+        scores.insert(Category::Grooming, 0.0);
+        assert_eq!(action(&triggered(&scores)), Action::Hide);
+    }
+
+    #[test]
+    fn a_missing_category_is_rejected() {
+        let complete = probabilities(None);
+        assert!(category_scores(&complete).is_ok());
+
+        let missing = probabilities(Some(Category::Doxxing));
+        assert_eq!(
+            category_scores(&missing).unwrap_err(),
+            Fault::InvalidResponse
+        );
+    }
+
+    fn probabilities(missing: Option<Category>) -> Probabilities {
+        Category::ALL
+            .into_iter()
+            .filter(|category| Some(*category) != missing)
+            .map(|category| (category.key(), 0.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_pending_decision_has_no_verdict() {
+        let decision = Decision {
+            message_id: "m1".to_owned(),
+            status: Status::Pending,
+            action: None,
+            categories: None,
+            triggered: Vec::new(),
+            decided_by: None,
+            latency_ms: None,
+        };
+        let value = serde_json::to_value(&decision).unwrap();
+        assert_eq!(value["status"], "pending");
+        assert!(value["action"].is_null());
+        assert!(value["categories"].is_null());
+        assert_eq!(value["triggered"], serde_json::json!([]));
+        assert!(value["decided_by"].is_null());
+        assert!(value["latency_ms"].is_null());
+    }
+}
