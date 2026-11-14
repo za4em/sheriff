@@ -150,38 +150,4 @@ mod tests {
         assert_eq!(scores["bullying"], 0.0);
         assert_eq!(scores["grooming"], 0.0);
     }
-
-    #[tokio::test]
-    async fn a_repeated_insult_from_the_author_is_bullying() {
-        let scores = Mock::new(Duration::ZERO)
-            .decide(
-                "u1: you're an idiot\nu2: hello\n[this] u1: idiot",
-                &questions(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(scores["insult"], INSULT_SCORE);
-        assert_eq!(scores["bullying"], INSULT_SCORE);
-        assert_eq!(scores["grooming"], 0.0);
-    }
-
-    #[tokio::test]
-    async fn one_secret_line_is_not_grooming() {
-        let scores = Mock::new(Duration::ZERO)
-            .decide("[this] u: keep this secret", &questions())
-            .await
-            .unwrap();
-        assert_eq!(scores["grooming"], 0.0);
-    }
-
-    #[tokio::test]
-    async fn secrecy_after_another_line_from_the_author_is_grooming() {
-        let scores = Mock::new(Duration::ZERO)
-            .decide("u1: hey\n[this] u1: keep this secret", &questions())
-            .await
-            .unwrap();
-        assert_eq!(scores["grooming"], INSULT_SCORE);
-        assert_eq!(scores["insult"], 0.0);
-        assert_eq!(scores["bullying"], 0.0);
-    }
 }

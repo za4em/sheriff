@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -23,7 +23,7 @@ struct DecideRequest<'a> {
 
 #[derive(serde::Deserialize)]
 struct DecideResponse {
-    questions: std::collections::BTreeMap<String, Answer>,
+    questions: BTreeMap<String, Answer>,
 }
 
 #[derive(serde::Deserialize)]
