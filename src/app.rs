@@ -22,7 +22,7 @@ impl App {
         sqlx::migrate!("./migrations").run(&pool).await?;
         let provider = Provider::from_config(config.provider)?;
         Ok(Self {
-            engine: Engine::new(pool, provider, config.window)?,
+            engine: Engine::new(pool, provider, config.window, config.threshold)?,
             api_key: config.api_key,
         })
     }

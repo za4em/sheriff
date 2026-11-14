@@ -9,8 +9,6 @@ use super::messages::IncomingMessage;
 use super::provider::{DecisionProvider, Fault, Probabilities, Provider, Question, Questions};
 use crate::error::AppError;
 
-const THRESHOLD: f64 = 0.8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
@@ -128,11 +126,16 @@ pub(crate) struct Decision {
 pub(crate) struct Decisions {
     pool: PgPool,
     provider: Provider,
+    threshold: f64,
 }
 
 impl Decisions {
-    pub(crate) fn new(pool: PgPool, provider: Provider) -> Self {
-        Self { pool, provider }
+    pub(crate) fn new(pool: PgPool, provider: Provider, threshold: f64) -> Self {
+        Self {
+            pool,
+            provider,
+            threshold,
+        }
     }
 
     pub(crate) async fn decide(
@@ -148,7 +151,7 @@ impl Decisions {
             .await
             .map_err(AppError::Provider)?;
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
-        let chosen = action(&hits(&categories));
+        let chosen = action(&hits(&categories, self.threshold));
         repository::write_ready(&self.pool, tenant, message, chosen, &categories).await?;
         Ok(Decision {
             message_id: message.message_id.clone(),
@@ -188,7 +191,7 @@ impl Decisions {
             user_id,
             after,
             category.map(Category::key),
-            THRESHOLD,
+            self.threshold,
         )
         .await
     }
@@ -214,10 +217,10 @@ fn category_scores(probabilities: &Probabilities) -> Result<CategoryScores, Faul
     Ok(scores)
 }
 
-fn hits(scores: &CategoryScores) -> Vec<Category> {
+fn hits(scores: &CategoryScores, threshold: f64) -> Vec<Category> {
     Category::ALL
         .into_iter()
-        .filter(|category| scores[category] >= THRESHOLD)
+        .filter(|category| scores[category] >= threshold)
         .collect()
 }
 
@@ -251,6 +254,8 @@ fn mutes(category: &Category) -> bool {
 mod tests {
     use super::*;
 
+    const THRESHOLD: f64 = 0.8;
+
     fn scores() -> CategoryScores {
         Category::ALL
             .into_iter()
@@ -271,9 +276,9 @@ mod tests {
     fn threshold_is_inclusive() {
         let mut scores = scores();
         scores.insert(Category::Insult, THRESHOLD);
-        assert_eq!(action(&hits(&scores)), Action::Hide);
+        assert_eq!(action(&hits(&scores, THRESHOLD)), Action::Hide);
         scores.insert(Category::Insult, THRESHOLD - 0.01);
-        assert_eq!(action(&hits(&scores)), Action::Allow);
+        assert_eq!(action(&hits(&scores, THRESHOLD)), Action::Allow);
     }
 
     #[test]
@@ -291,7 +296,7 @@ mod tests {
         ] {
             let mut scores = scores();
             scores.insert(category, THRESHOLD);
-            assert_eq!(action(&hits(&scores)), expected);
+            assert_eq!(action(&hits(&scores, THRESHOLD)), expected);
         }
     }
 
@@ -300,10 +305,10 @@ mod tests {
         let mut scores = scores();
         scores.insert(Category::Doxxing, THRESHOLD);
         scores.insert(Category::Scam, THRESHOLD);
-        assert_eq!(action(&hits(&scores)), Action::Mute);
+        assert_eq!(action(&hits(&scores, THRESHOLD)), Action::Mute);
 
         scores.insert(Category::Threat, THRESHOLD);
-        assert_eq!(action(&hits(&scores)), Action::Escalate);
+        assert_eq!(action(&hits(&scores, THRESHOLD)), Action::Escalate);
     }
 
     #[test]

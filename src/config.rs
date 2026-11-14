@@ -8,6 +8,7 @@ pub struct Config {
     pub(crate) provider: ProviderConfig,
     pub(crate) api_key: String,
     pub(crate) window: i64,
+    pub(crate) threshold: f64,
 }
 
 pub struct ServerConfig {
@@ -32,6 +33,7 @@ impl Config {
             provider: provider()?,
             api_key: required("SHERIFF_API_KEY")?,
             window: window()?,
+            threshold: threshold()?,
         })
     }
 }
@@ -58,13 +60,24 @@ fn provider() -> Result<ProviderConfig, Box<dyn Error>> {
     }
 }
 
+fn threshold() -> Result<f64, Box<dyn Error>> {
+    let raw = var_or("SHERIFF_SCORE_THRESHOLD", "0.8");
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| "SHERIFF_SCORE_THRESHOLD must be a number".to_owned())?;
+    if !value.is_finite() || value <= 0.0 || value > 1.0 {
+        return Err("SHERIFF_SCORE_THRESHOLD must be greater than 0 and at most 1".into());
+    }
+    Ok(value)
+}
+
 fn window() -> Result<i64, Box<dyn Error>> {
-    let raw = var_or("SHERIFF_WINDOW", "50");
+    let raw = var_or("SHERIFF_MESSAGES_WINDOW", "50");
     let value: i64 = raw
         .parse()
-        .map_err(|_| "SHERIFF_WINDOW must be a number".to_owned())?;
+        .map_err(|_| "SHERIFF_MESSAGES_WINDOW must be a number".to_owned())?;
     if value <= 0 {
-        return Err("SHERIFF_WINDOW must be greater than 0".into());
+        return Err("SHERIFF_MESSAGES_WINDOW must be greater than 0".into());
     }
     Ok(value)
 }

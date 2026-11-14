@@ -22,10 +22,11 @@ impl Engine {
         pool: PgPool,
         provider: Provider,
         window: i64,
+        threshold: f64,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             messages: Messages::new(pool.clone(), window),
-            decisions: Decisions::new(pool.clone(), provider),
+            decisions: Decisions::new(pool.clone(), provider, threshold),
             webhooks: Webhooks::new(pool)?,
         })
     }
