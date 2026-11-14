@@ -43,7 +43,6 @@ pub(super) async fn window(
     tenant: &str,
     room: &str,
     limit: i64,
-    later_ids: &[String],
 ) -> Result<Vec<IncomingMessage>, AppError> {
     sqlx::query_as(
         r#"
@@ -51,7 +50,6 @@ pub(super) async fn window(
         FROM messages
         WHERE tenant_id = $1
           AND room_id = $2
-          AND message_id <> ALL($4::text[])
         ORDER BY timestamp DESC
         LIMIT $3
         "#,
@@ -59,7 +57,6 @@ pub(super) async fn window(
     .bind(tenant)
     .bind(room)
     .bind(limit)
-    .bind(later_ids)
     .fetch_all(pool)
     .await
     .map_err(|err| database("loading a message window", err))

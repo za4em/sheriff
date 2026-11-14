@@ -47,10 +47,8 @@ impl Messages {
         &self,
         tenant: &str,
         room: &str,
-        limit: i64,
-        later_ids: &[String],
     ) -> Result<Vec<IncomingMessage>, AppError> {
-        let mut messages = repository::window(&self.pool, tenant, room, limit, later_ids).await?;
+        let mut messages = repository::window(&self.pool, tenant, room, WINDOW).await?;
         messages.reverse();
         Ok(messages)
     }

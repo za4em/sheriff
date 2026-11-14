@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
+
 use sqlx::PgPool;
 
 use super::decisions::Decision;
-use super::messages::{IncomingMessage, WINDOW};
+use super::messages::IncomingMessage;
 use super::provider::{JUDGED, Provider};
 use super::{decisions::Decisions, messages::Messages, webhooks::Webhooks};
 use crate::error::AppError;
+
+type RoomWindows = BTreeMap<String, Vec<IncomingMessage>>;
 
 #[derive(Clone)]
 pub(crate) struct Engine {
@@ -28,13 +32,12 @@ impl Engine {
         messages: Vec<IncomingMessage>,
     ) -> Result<Vec<Decision>, AppError> {
         validate_all(&messages)?;
+        let windows = self.windows(tenant, &messages).await?;
         self.upsert_all(tenant, &messages).await?;
         let mut decisions = Vec::with_capacity(messages.len());
         for (index, message) in messages.iter().enumerate() {
-            decisions.push(
-                self.decide(tenant, message, &later_ids(&messages, index))
-                    .await?,
-            );
+            let state = state(&windows, &messages, index);
+            decisions.push(self.decisions.decide(tenant, message, &state).await?);
         }
         Ok(decisions)
     }
@@ -45,6 +48,7 @@ impl Engine {
         messages: Vec<IncomingMessage>,
     ) -> Result<(), AppError> {
         validate_all(&messages)?;
+        let windows = self.windows(tenant, &messages).await?;
         self.upsert_all(tenant, &messages).await?;
         for message in &messages {
             self.decisions.mark_pending(tenant, message).await?;
@@ -52,20 +56,37 @@ impl Engine {
         let engine = self.clone();
         let tenant = tenant.to_owned();
         tokio::spawn(async move {
-            engine.finish(&tenant, &messages).await;
+            engine.finish(&tenant, &messages, &windows).await;
         });
         Ok(())
     }
 
-    async fn finish(&self, tenant: &str, messages: &[IncomingMessage]) {
+    async fn finish(&self, tenant: &str, messages: &[IncomingMessage], windows: &RoomWindows) {
         for (index, message) in messages.iter().enumerate() {
-            if let Err(err) = self
-                .deliver_decision(tenant, message, &later_ids(messages, index))
-                .await
-            {
+            let state = state(windows, messages, index);
+            if let Err(err) = self.deliver_decision(tenant, message, &state).await {
                 log_background(&err);
             }
         }
+    }
+
+    async fn windows(
+        &self,
+        tenant: &str,
+        messages: &[IncomingMessage],
+    ) -> Result<RoomWindows, AppError> {
+        let mut rooms = Vec::new();
+        for message in messages {
+            if !rooms.iter().any(|room: &String| room == &message.room_id) {
+                rooms.push(message.room_id.clone());
+            }
+        }
+        let mut windows = RoomWindows::new();
+        for room in rooms {
+            let window = self.messages.window(tenant, &room).await?;
+            windows.insert(room, window);
+        }
+        Ok(windows)
     }
 
     async fn upsert_all(&self, tenant: &str, messages: &[IncomingMessage]) -> Result<(), AppError> {
@@ -75,45 +96,50 @@ impl Engine {
         Ok(())
     }
 
-    async fn decide(
-        &self,
-        tenant: &str,
-        message: &IncomingMessage,
-        later: &[String],
-    ) -> Result<Decision, AppError> {
-        let state = self.state(tenant, message, later).await?;
-        self.decisions.decide(tenant, message, &state).await
-    }
-
     async fn deliver_decision(
         &self,
         tenant: &str,
         message: &IncomingMessage,
-        later: &[String],
+        state: &str,
     ) -> Result<(), AppError> {
-        let decision = self.decide(tenant, message, later).await?;
+        let decision = self.decisions.decide(tenant, message, state).await?;
         self.webhooks.deliver_decision(tenant, &decision).await
     }
+}
 
-    async fn state(
-        &self,
-        tenant: &str,
-        message: &IncomingMessage,
-        later: &[String],
-    ) -> Result<String, AppError> {
-        let mut window = self
-            .messages
-            .window(tenant, &message.room_id, WINDOW, later)
-            .await?;
-        if !window
-            .iter()
-            .any(|existing| existing.message_id == message.message_id)
+fn state(windows: &RoomWindows, messages: &[IncomingMessage], index: usize) -> String {
+    let window = context(
+        windows
+            .get(&messages[index].room_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        messages,
+        index,
+    );
+    lines(&window, &messages[index].message_id)
+}
+
+fn context(
+    prior: &[IncomingMessage],
+    batch: &[IncomingMessage],
+    index: usize,
+) -> Vec<IncomingMessage> {
+    let room = &batch[index].room_id;
+    let mut window = prior.to_vec();
+    for message in batch[..=index]
+        .iter()
+        .filter(|message| &message.room_id == room)
+    {
+        if let Some(existing) = window
+            .iter_mut()
+            .find(|row| row.message_id == message.message_id)
         {
+            *existing = message.clone();
+        } else {
             window.push(message.clone());
-            window.sort_by_key(|existing| existing.timestamp);
         }
-        Ok(lines(&window, &message.message_id))
     }
+    window
 }
 
 fn validate_all(messages: &[IncomingMessage]) -> Result<(), AppError> {
@@ -150,14 +176,6 @@ fn lines(messages: &[IncomingMessage], judged_id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn later_ids(messages: &[IncomingMessage], index: usize) -> Vec<String> {
-    messages[index + 1..]
-        .iter()
-        .filter(|later| later.room_id == messages[index].room_id)
-        .map(|later| later.message_id.clone())
-        .collect()
 }
 
 fn log_background(err: &AppError) {
@@ -225,17 +243,56 @@ mod tests {
     }
 
     #[test]
-    fn later_messages_in_the_batch_are_not_context_yet() {
-        let messages = vec![
-            message("m1", "r", "u1", "you're an idiot"),
-            message("m2", "r", "u2", "hello"),
-            message("m3", "other", "u1", "ok"),
-            message("m4", "r", "u1", "idiot"),
+    fn the_batch_is_applied_onto_the_room_in_order() {
+        let prior = vec![at(message("m0", "r", "u0", "earlier"), 1)];
+        let batch = vec![
+            at(message("m1", "r", "u1", "you're an idiot"), 3),
+            at(message("m2", "r", "u2", "hello"), 4),
+            at(message("m3", "other", "u1", "ok"), 5),
+            at(message("m4", "r", "u1", "idiot"), 6),
         ];
         assert_eq!(
-            later_ids(&messages, 0),
-            vec!["m2".to_owned(), "m4".to_owned()]
+            lines(&context(&prior, &batch, 0), "m1"),
+            "u0: earlier\n[this] u1: you're an idiot"
         );
-        assert!(later_ids(&messages, 3).is_empty());
+        assert_eq!(
+            lines(&context(&prior, &batch, 1), "m2"),
+            "u0: earlier\nu1: you're an idiot\n[this] u2: hello"
+        );
+        assert_eq!(lines(&context(&[], &batch, 2), "m3"), "[this] u1: ok");
+        let fourth = context(&prior, &batch, 3);
+        assert!(fourth.iter().any(|message| message.message_id == "m1"));
+        assert!(fourth.iter().any(|message| message.message_id == "m2"));
+        assert!(fourth.iter().all(|message| message.room_id == "r"));
+    }
+
+    #[test]
+    fn an_incoming_line_replaces_the_stored_copy() {
+        let prior = vec![at(message("m1", "r", "u1", "old"), 1)];
+        let batch = vec![
+            at(message("m1", "r", "u1", "first"), 2),
+            at(message("m1", "r", "u1", "second"), 3),
+        ];
+        let window = context(&prior, &batch, 1);
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].text, "second");
+    }
+
+    #[test]
+    fn the_batch_is_appended_in_request_order() {
+        let prior = vec![at(message("m0", "r", "u0", "stored"), 5)];
+        let batch = vec![
+            at(message("m1", "r", "u1", "first"), 1),
+            at(message("m2", "r", "u2", "second"), 9),
+        ];
+        assert_eq!(
+            lines(&context(&prior, &batch, 1), "m2"),
+            "u0: stored\nu1: first\n[this] u2: second"
+        );
+    }
+
+    fn at(mut message: IncomingMessage, timestamp: i64) -> IncomingMessage {
+        message.timestamp = timestamp;
+        message
     }
 }
