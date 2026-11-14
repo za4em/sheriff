@@ -25,7 +25,6 @@ pub(crate) enum Status {
 pub(crate) enum Action {
     Allow,
     Hide,
-    Warn,
     Mute,
     Escalate,
 }
@@ -225,13 +224,27 @@ fn hits(scores: &CategoryScores) -> Vec<Category> {
 fn action(hits: &[Category]) -> Action {
     if hits.is_empty() {
         Action::Allow
-    } else if hits.contains(&Category::Grooming) {
+    } else if hits.iter().any(escalates) {
         Action::Escalate
-    } else if hits.len() == 1 && hits[0] == Category::Spam {
-        Action::Warn
+    } else if hits.iter().any(mutes) {
+        Action::Mute
     } else {
         Action::Hide
     }
+}
+
+fn escalates(category: &Category) -> bool {
+    matches!(
+        category,
+        Category::Grooming | Category::Threat | Category::IllegalActivity
+    )
+}
+
+fn mutes(category: &Category) -> bool {
+    matches!(
+        category,
+        Category::Bullying | Category::Spam | Category::Scam
+    )
 }
 
 #[cfg(test)]
@@ -264,32 +277,33 @@ mod tests {
     }
 
     #[test]
-    fn spam_alone_warns_and_spam_with_an_insult_hides() {
-        let mut scores = scores();
-        scores.insert(Category::Spam, THRESHOLD);
-        let spam = hits(&scores);
-        assert_eq!(spam, vec![Category::Spam]);
-        assert_eq!(action(&spam), Action::Warn);
-
-        scores.insert(Category::Insult, THRESHOLD);
-        let both = hits(&scores);
-        assert_eq!(both, vec![Category::Insult, Category::Spam]);
-        assert_eq!(action(&both), Action::Hide);
+    fn each_hit_category_chooses_its_action() {
+        for (category, expected) in [
+            (Category::Insult, Action::Hide),
+            (Category::Bullying, Action::Mute),
+            (Category::Grooming, Action::Escalate),
+            (Category::Hate, Action::Hide),
+            (Category::Threat, Action::Escalate),
+            (Category::Scam, Action::Mute),
+            (Category::IllegalActivity, Action::Escalate),
+            (Category::Doxxing, Action::Hide),
+            (Category::Spam, Action::Mute),
+        ] {
+            let mut scores = scores();
+            scores.insert(category, THRESHOLD);
+            assert_eq!(action(&hits(&scores)), expected);
+        }
     }
 
     #[test]
-    fn grooming_escalates_even_when_another_category_also_hits() {
+    fn the_stronger_action_wins() {
         let mut scores = scores();
-        scores.insert(Category::Grooming, THRESHOLD);
+        scores.insert(Category::Doxxing, THRESHOLD);
+        scores.insert(Category::Scam, THRESHOLD);
+        assert_eq!(action(&hits(&scores)), Action::Mute);
+
+        scores.insert(Category::Threat, THRESHOLD);
         assert_eq!(action(&hits(&scores)), Action::Escalate);
-
-        scores.insert(Category::Insult, THRESHOLD);
-        let both = hits(&scores);
-        assert_eq!(both, vec![Category::Insult, Category::Grooming]);
-        assert_eq!(action(&both), Action::Escalate);
-
-        scores.insert(Category::Grooming, 0.0);
-        assert_eq!(action(&hits(&scores)), Action::Hide);
     }
 
     #[test]
