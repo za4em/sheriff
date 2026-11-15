@@ -47,7 +47,9 @@ impl Engine {
             match self.decisions.score(id, message, &state).await {
                 Ok(decision) => decisions.push(decision),
                 Err(err) => {
-                    self.decisions.mark_failed(id).await?;
+                    if let Err(mark_err) = self.decisions.mark_failed(id).await {
+                        log_background(&mark_err);
+                    }
                     if first_error.is_none() {
                         first_error = Some(err);
                     }

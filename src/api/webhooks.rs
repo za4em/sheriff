@@ -2,7 +2,7 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use serde::Deserialize;
 
 use super::tenant::Tenant;
-use crate::{app::App, core::webhooks::Registered, error::AppError};
+use crate::{app::App, core::webhooks::RegisteredEndpoint, error::AppError};
 
 pub(crate) fn routes() -> Router<App> {
     Router::new().route("/v1/webhooks", post(create))
@@ -17,7 +17,7 @@ async fn create(
     tenant: Tenant,
     State(app): State<App>,
     Json(request): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<Registered>), AppError> {
+) -> Result<(StatusCode, Json<RegisteredEndpoint>), AppError> {
     let registered = app
         .engine
         .webhooks

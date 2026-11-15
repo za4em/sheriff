@@ -17,7 +17,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 type Signer = Hmac<Sha256>;
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Registered {
+pub(crate) struct RegisteredEndpoint {
     pub(crate) id: i64,
     pub(crate) url: String,
     pub(crate) secret: String,
@@ -35,11 +35,15 @@ impl Webhooks {
         Ok(Self { pool, http })
     }
 
-    pub(crate) async fn register(&self, tenant: &str, url: &str) -> Result<Registered, AppError> {
+    pub(crate) async fn register(
+        &self,
+        tenant: &str,
+        url: &str,
+    ) -> Result<RegisteredEndpoint, AppError> {
         let url = require_url(url)?;
         let secret = Uuid::new_v4().simple().to_string();
         let id = repository::insert(&self.pool, tenant, &url, &secret).await?;
-        Ok(Registered { id, url, secret })
+        Ok(RegisteredEndpoint { id, url, secret })
     }
 
     pub(crate) async fn deliver_decision(
