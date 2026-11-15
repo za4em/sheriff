@@ -7,11 +7,19 @@ use super::messages::IncomingMessage;
 use super::provider::{JUDGED, Provider};
 use super::{decisions::Decisions, messages::Messages, webhooks::Webhooks};
 use crate::error::AppError;
+use serde::Serialize;
 
 type RoomWindows = BTreeMap<String, Vec<IncomingMessage>>;
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum Score {
+    Ready(Decision),
+    Failed { message_id: String, error: String },
+}
+
 struct Job {
-    tenant: String,
+    tenant: Option<String>,
     messages: Vec<IncomingMessage>,
     windows: RoomWindows,
     ids: Vec<i64>,
@@ -38,17 +46,16 @@ impl Engine {
         })
     }
 
-    pub(crate) async fn submit_sync(
+    pub(crate) async fn score(
         &self,
-        tenant: &str,
         messages: Vec<IncomingMessage>,
-    ) -> Result<Vec<Decision>, AppError> {
-        let job = self.prepare(tenant, messages).await?;
-        if job.ids.is_empty() {
+    ) -> Result<Vec<Score>, AppError> {
+        let job = self.prepare(None, messages).await?;
+        if job.messages.is_empty() {
             return Ok(Vec::new());
         }
-        match self.spawn(job, false).await {
-            Ok(result) => result,
+        match self.spawn(job).await {
+            Ok(scores) => Ok(scores),
             Err(err) => {
                 tracing::error!(error = %err, "worker stopped");
                 Err(AppError::Database {
@@ -58,75 +65,83 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn submit_async(
+    pub(crate) async fn submit(
         &self,
         tenant: &str,
         messages: Vec<IncomingMessage>,
     ) -> Result<(), AppError> {
-        let job = self.prepare(tenant, messages).await?;
-        if job.ids.is_empty() {
+        let job = self.prepare(Some(tenant), messages).await?;
+        if job.messages.is_empty() {
             return Ok(());
         }
-        self.spawn(job, true);
+        self.spawn(job);
         Ok(())
     }
 
-    async fn prepare(&self, tenant: &str, messages: Vec<IncomingMessage>) -> Result<Job, AppError> {
+    /// Pass a tenant to save the batch on that profile.
+    async fn prepare(
+        &self,
+        tenant: Option<&str>,
+        messages: Vec<IncomingMessage>,
+    ) -> Result<Job, AppError> {
         validate_all(&messages)?;
-        let windows = self.windows(tenant, &messages).await?;
-        self.upsert_all(tenant, &messages).await?;
-        let ids = self.decisions.open(tenant, &messages).await?;
+        let mut windows = RoomWindows::new();
+        let mut ids = Vec::new();
+        if !messages.is_empty()
+            && let Some(tenant) = tenant
+        {
+            windows = self.windows(tenant, &messages).await?;
+            self.upsert_all(tenant, &messages).await?;
+            ids = self.decisions.open(tenant, &messages).await?;
+        }
         Ok(Job {
-            tenant: tenant.to_owned(),
+            tenant: tenant.map(str::to_owned),
             messages,
             windows,
             ids,
         })
     }
 
-    fn spawn(
-        &self,
-        job: Job,
-        deliver: bool,
-    ) -> tokio::task::JoinHandle<Result<Vec<Decision>, AppError>> {
+    fn spawn(&self, job: Job) -> tokio::task::JoinHandle<Vec<Score>> {
         let engine = self.clone();
-        tokio::spawn(async move { engine.finish(job, deliver).await })
+        tokio::spawn(async move { engine.finish(job).await })
     }
 
-    async fn finish(&self, job: Job, deliver: bool) -> Result<Vec<Decision>, AppError> {
-        let mut decisions = Vec::with_capacity(job.ids.len());
-        let mut first_error = None;
-        for (index, id) in job.ids.into_iter().enumerate() {
+    async fn finish(&self, job: Job) -> Vec<Score> {
+        let mut scores = Vec::with_capacity(job.messages.len());
+        for (index, message) in job.messages.iter().enumerate() {
             let state = state(&job.windows, &job.messages, index);
-            let scored = self.decisions.score(id, &job.messages[index], &state).await;
-            match self.apply(&job.tenant, id, deliver, scored).await {
-                Ok(decision) => decisions.push(decision),
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
+            let mut scored = self.decisions.score(message, &state).await;
+            if let Some(tenant) = &job.tenant {
+                let id = job.ids[index];
+                scored = self.store(id, scored).await;
+                scored = self.apply(tenant, id, scored).await;
             }
+            scores.push(scored_message(message, scored));
         }
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-        Ok(decisions)
+        scores
+    }
+
+    async fn store(
+        &self,
+        id: i64,
+        scored: Result<Decision, AppError>,
+    ) -> Result<Decision, AppError> {
+        let decision = scored?;
+        self.decisions.write_ready(id, &decision).await?;
+        Ok(decision)
     }
 
     async fn apply(
         &self,
         tenant: &str,
         id: i64,
-        deliver: bool,
         scored: Result<Decision, AppError>,
     ) -> Result<Decision, AppError> {
         match scored {
             Ok(decision) => {
-                if deliver {
-                    if let Err(err) = self.webhooks.deliver_decision(tenant, &decision).await {
-                        log_background(&err);
-                    }
+                if let Err(err) = self.webhooks.deliver_decision(tenant, &decision).await {
+                    log_background(&err);
                 }
                 Ok(decision)
             }
@@ -134,9 +149,7 @@ impl Engine {
                 if let Err(mark_err) = self.decisions.mark_failed(id).await {
                     log_background(&mark_err);
                 }
-                if deliver {
-                    log_background(&err);
-                }
+                log_background(&err);
                 Err(err)
             }
         }
@@ -166,6 +179,16 @@ impl Engine {
             self.messages.upsert(tenant, message).await?;
         }
         Ok(())
+    }
+}
+
+fn scored_message(message: &IncomingMessage, scored: Result<Decision, AppError>) -> Score {
+    match scored {
+        Ok(decision) => Score::Ready(decision),
+        Err(err) => Score::Failed {
+            message_id: message.message_id.clone(),
+            error: err.to_string(),
+        },
     }
 }
 

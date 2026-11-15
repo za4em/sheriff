@@ -56,7 +56,6 @@ impl Decisions {
 
     pub(crate) async fn score(
         &self,
-        decision_id: i64,
         message: &IncomingMessage,
         state: &str,
     ) -> Result<Decision, AppError> {
@@ -68,13 +67,24 @@ impl Decisions {
             .map_err(AppError::Provider)?;
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
         let chosen = category::action(&hits(&categories, self.threshold));
-        repository::write_ready(&self.pool, decision_id, chosen, &categories).await?;
         Ok(Decision {
             message_id: message.message_id.clone(),
             status: Status::Ready,
             action: Some(chosen),
             categories: Some(categories),
         })
+    }
+
+    pub(crate) async fn write_ready(
+        &self,
+        decision_id: i64,
+        decision: &Decision,
+    ) -> Result<(), AppError> {
+        let (Some(action), Some(categories)) = (decision.action, decision.categories.as_ref())
+        else {
+            return Ok(());
+        };
+        repository::write_ready(&self.pool, decision_id, action, categories).await
     }
 
     pub(crate) async fn mark_failed(&self, decision_id: i64) -> Result<(), AppError> {

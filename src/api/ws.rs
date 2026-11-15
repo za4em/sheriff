@@ -56,8 +56,8 @@ async fn handle_frame(
 ) -> bool {
     match frame {
         Message::Text(text) => match serde_json::from_str::<Vec<IncomingMessage>>(text.as_str()) {
-            Ok(messages) => match engine.submit_sync(tenant_id, messages).await {
-                Ok(decisions) => send_json(socket, &decisions).await,
+            Ok(messages) => match engine.submit(tenant_id, messages).await {
+                Ok(()) => true,
                 Err(err) => send_error(socket, &err).await,
             },
             Err(_) => send_error(socket, &AppError::InvalidMessage).await,
