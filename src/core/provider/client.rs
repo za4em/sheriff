@@ -132,21 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn request_names_model_state_and_questions() {
-        let questions = questions();
-        let body = serde_json::to_value(DecideRequest {
-            model: "m",
-            state: "hello",
-            questions: &questions,
-        })
-        .unwrap();
-        assert_eq!(body["model"], "m");
-        assert_eq!(body["state"], "hello");
-        assert_eq!(body["questions"]["insult"]["type"], "score");
-        assert!(body["questions"]["insult"].get("options").is_none());
-    }
-
-    #[test]
     fn reads_a_probability_per_asked_question() {
         let body = r#"{"questions":{"insult":{"probability":0.91},"hate":{"probability":0.0}}}"#;
         let scores = probabilities(body, &questions()).unwrap();

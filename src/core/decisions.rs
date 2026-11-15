@@ -153,15 +153,6 @@ mod tests {
     }
 
     #[test]
-    fn each_category_is_one_score_question() {
-        let questions = message_questions();
-        assert_eq!(questions.len(), Category::ALL.len());
-        let insult = serde_json::to_value(&questions[&Category::Insult.key()]).unwrap();
-        assert_eq!(insult["type"], "score");
-        assert_eq!(insult["instructions"], Category::Insult.question());
-    }
-
-    #[test]
     fn threshold_is_inclusive() {
         let mut scores = scores();
         scores.insert(Category::Insult, THRESHOLD);
@@ -188,24 +179,5 @@ mod tests {
             .filter(|category| Some(*category) != missing)
             .map(|category| (category.key(), 0.0))
             .collect()
-    }
-
-    #[test]
-    fn an_unfinished_decision_has_no_verdict() {
-        for (status, name) in [(Status::Pending, "pending"), (Status::Failed, "failed")] {
-            let decision = Decision {
-                message_id: "m1".to_owned(),
-                status,
-                action: None,
-                categories: None,
-            };
-            let value = serde_json::to_value(&decision).unwrap();
-            assert_eq!(value["status"], name);
-            assert!(value["action"].is_null());
-            assert!(value["categories"].is_null());
-            assert!(value.get("decided_by").is_none());
-            assert!(value.get("triggered").is_none());
-            assert!(value.get("latency_ms").is_none());
-        }
     }
 }

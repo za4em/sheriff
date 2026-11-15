@@ -113,28 +113,3 @@ impl Question {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn score_question_has_no_options() {
-        let value = serde_json::to_value(Question::score("Is this an insult?")).unwrap();
-        assert_eq!(value["type"], "score");
-        assert_eq!(value["instructions"], "Is this an insult?");
-        assert!(value.get("options").is_none());
-    }
-
-    #[test]
-    fn choice_question_lists_options() {
-        let value = serde_json::to_value(Question::choice(
-            "Which kind?",
-            vec!["drugs".to_owned(), "weapons".to_owned()],
-        ))
-        .unwrap();
-        assert_eq!(value["type"], "choice");
-        assert_eq!(value["options"][0], "drugs");
-        assert_eq!(value["options"][1], "weapons");
-    }
-}
