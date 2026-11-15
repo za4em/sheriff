@@ -10,6 +10,13 @@ use crate::error::AppError;
 
 type RoomWindows = BTreeMap<String, Vec<IncomingMessage>>;
 
+struct Job {
+    tenant: String,
+    messages: Vec<IncomingMessage>,
+    windows: RoomWindows,
+    ids: Vec<i64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Engine {
     pub(crate) messages: Messages,
@@ -36,20 +43,65 @@ impl Engine {
         tenant: &str,
         messages: Vec<IncomingMessage>,
     ) -> Result<Vec<Decision>, AppError> {
+        let job = self.prepare(tenant, messages).await?;
+        if job.ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.spawn(job, false).await {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::error!(error = %err, "worker stopped");
+                Err(AppError::Database {
+                    action: "running the worker",
+                })
+            }
+        }
+    }
+
+    pub(crate) async fn submit_async(
+        &self,
+        tenant: &str,
+        messages: Vec<IncomingMessage>,
+    ) -> Result<(), AppError> {
+        let job = self.prepare(tenant, messages).await?;
+        if job.ids.is_empty() {
+            return Ok(());
+        }
+        self.spawn(job, true);
+        Ok(())
+    }
+
+    async fn prepare(&self, tenant: &str, messages: Vec<IncomingMessage>) -> Result<Job, AppError> {
         validate_all(&messages)?;
         let windows = self.windows(tenant, &messages).await?;
         self.upsert_all(tenant, &messages).await?;
         let ids = self.decisions.open(tenant, &messages).await?;
-        let mut decisions = Vec::with_capacity(messages.len());
+        Ok(Job {
+            tenant: tenant.to_owned(),
+            messages,
+            windows,
+            ids,
+        })
+    }
+
+    fn spawn(
+        &self,
+        job: Job,
+        deliver: bool,
+    ) -> tokio::task::JoinHandle<Result<Vec<Decision>, AppError>> {
+        let engine = self.clone();
+        tokio::spawn(async move { engine.finish(job, deliver).await })
+    }
+
+    async fn finish(&self, job: Job, deliver: bool) -> Result<Vec<Decision>, AppError> {
+        let mut decisions = Vec::with_capacity(job.ids.len());
         let mut first_error = None;
-        for (index, (message, id)) in messages.iter().zip(ids).enumerate() {
-            let state = state(&windows, &messages, index);
-            match self.decisions.score(id, message, &state).await {
+        for (index, id) in job.ids.into_iter().enumerate() {
+            let state = state(&job.windows, &job.messages, index);
+            let scored = self.decisions.score(id, &job.messages[index], &state).await;
+            match self.apply(&job.tenant, id, deliver, scored).await {
                 Ok(decision) => decisions.push(decision),
                 Err(err) => {
-                    if let Err(mark_err) = self.decisions.mark_failed(id).await {
-                        log_background(&mark_err);
-                    }
                     if first_error.is_none() {
                         first_error = Some(err);
                     }
@@ -62,48 +114,30 @@ impl Engine {
         Ok(decisions)
     }
 
-    pub(crate) async fn submit_async(
+    async fn apply(
         &self,
         tenant: &str,
-        messages: Vec<IncomingMessage>,
-    ) -> Result<(), AppError> {
-        validate_all(&messages)?;
-        let windows = self.windows(tenant, &messages).await?;
-        self.upsert_all(tenant, &messages).await?;
-        let ids = self.decisions.open(tenant, &messages).await?;
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let jobs: Vec<(usize, i64)> = ids.into_iter().enumerate().collect();
-        let engine = self.clone();
-        let tenant = tenant.to_owned();
-        tokio::spawn(async move {
-            engine.finish(&tenant, &messages, &windows, &jobs).await;
-        });
-        Ok(())
-    }
-
-    async fn finish(
-        &self,
-        tenant: &str,
-        messages: &[IncomingMessage],
-        windows: &RoomWindows,
-        jobs: &[(usize, i64)],
-    ) {
-        for (index, id) in jobs {
-            let state = state(windows, messages, *index);
-            match self.decisions.score(*id, &messages[*index], &state).await {
-                Ok(decision) => {
+        id: i64,
+        deliver: bool,
+        scored: Result<Decision, AppError>,
+    ) -> Result<Decision, AppError> {
+        match scored {
+            Ok(decision) => {
+                if deliver {
                     if let Err(err) = self.webhooks.deliver_decision(tenant, &decision).await {
                         log_background(&err);
                     }
                 }
-                Err(err) => {
-                    if let Err(mark_err) = self.decisions.mark_failed(*id).await {
-                        log_background(&mark_err);
-                    }
+                Ok(decision)
+            }
+            Err(err) => {
+                if let Err(mark_err) = self.decisions.mark_failed(id).await {
+                    log_background(&mark_err);
+                }
+                if deliver {
                     log_background(&err);
                 }
+                Err(err)
             }
         }
     }
