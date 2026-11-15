@@ -39,16 +39,23 @@ impl Engine {
         validate_all(&messages)?;
         let windows = self.windows(tenant, &messages).await?;
         self.upsert_all(tenant, &messages).await?;
+        let ids = self.decisions.open(tenant, &messages).await?;
         let mut decisions = Vec::with_capacity(messages.len());
-        for (index, message) in messages.iter().enumerate() {
+        let mut first_error = None;
+        for (index, (message, id)) in messages.iter().zip(ids).enumerate() {
             let state = state(&windows, &messages, index);
-            match self.decisions.decide(tenant, message, &state).await {
+            match self.decisions.score(id, message, &state).await {
                 Ok(decision) => decisions.push(decision),
                 Err(err) => {
-                    self.decisions.mark_failed(tenant, message).await?;
-                    return Err(err);
+                    self.decisions.mark_failed(id).await?;
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
                 }
             }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
         }
         Ok(decisions)
     }
@@ -61,28 +68,36 @@ impl Engine {
         validate_all(&messages)?;
         let windows = self.windows(tenant, &messages).await?;
         self.upsert_all(tenant, &messages).await?;
-        for message in &messages {
-            self.decisions.mark_pending(tenant, message).await?;
+        let ids = self.decisions.open(tenant, &messages).await?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let jobs: Vec<(usize, i64)> = ids.into_iter().enumerate().collect();
         let engine = self.clone();
         let tenant = tenant.to_owned();
         tokio::spawn(async move {
-            engine.finish(&tenant, &messages, &windows).await;
+            engine.finish(&tenant, &messages, &windows, &jobs).await;
         });
         Ok(())
     }
 
-    async fn finish(&self, tenant: &str, messages: &[IncomingMessage], windows: &RoomWindows) {
-        for (index, message) in messages.iter().enumerate() {
-            let state = state(windows, messages, index);
-            match self.decisions.decide(tenant, message, &state).await {
+    async fn finish(
+        &self,
+        tenant: &str,
+        messages: &[IncomingMessage],
+        windows: &RoomWindows,
+        jobs: &[(usize, i64)],
+    ) {
+        for (index, id) in jobs {
+            let state = state(windows, messages, *index);
+            match self.decisions.score(*id, &messages[*index], &state).await {
                 Ok(decision) => {
                     if let Err(err) = self.webhooks.deliver_decision(tenant, &decision).await {
                         log_background(&err);
                     }
                 }
                 Err(err) => {
-                    if let Err(mark_err) = self.decisions.mark_failed(tenant, message).await {
+                    if let Err(mark_err) = self.decisions.mark_failed(*id).await {
                         log_background(&mark_err);
                     }
                     log_background(&err);
@@ -203,7 +218,8 @@ fn log_background(err: &AppError) {
         | AppError::UnknownCategory
         | AppError::WebhookUrlRequired
         | AppError::WebhookUrlInvalid
-        | AppError::WebhookEncode => tracing::error!("background submit failed"),
+        | AppError::WebhookEncode
+        | AppError::InvalidLimit => tracing::error!("background submit failed"),
     }
 }
 

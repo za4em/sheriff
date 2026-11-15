@@ -16,6 +16,7 @@ pub(crate) enum AppError {
     WebhookUrlRequired,
     WebhookUrlInvalid,
     WebhookEncode,
+    InvalidLimit,
     Database { action: &'static str },
     Provider(Fault),
 }
@@ -46,7 +47,8 @@ fn status(err: &AppError) -> StatusCode {
         | AppError::MessageIncomplete { .. }
         | AppError::UnknownCategory
         | AppError::WebhookUrlRequired
-        | AppError::WebhookUrlInvalid => StatusCode::BAD_REQUEST,
+        | AppError::WebhookUrlInvalid
+        | AppError::InvalidLimit => StatusCode::BAD_REQUEST,
         AppError::WebhookEncode | AppError::Database { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         AppError::Provider(_) => StatusCode::BAD_GATEWAY,
     }
@@ -69,6 +71,7 @@ fn client_message(err: &AppError) -> String {
             "A webhook URL must start with http:// or https://.".to_owned()
         }
         AppError::WebhookEncode => "A webhook body could not be encoded.".to_owned(),
+        AppError::InvalidLimit => "A limit must be from 1 to 100.".to_owned(),
         AppError::Database { action } => format!("The database failed while {action}."),
         AppError::Provider(fault) => {
             format!(

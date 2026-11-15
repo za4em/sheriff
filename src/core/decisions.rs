@@ -46,9 +46,17 @@ impl Decisions {
         }
     }
 
-    pub(crate) async fn decide(
+    pub(crate) async fn open(
         &self,
         tenant: &str,
+        messages: &[IncomingMessage],
+    ) -> Result<Vec<i64>, AppError> {
+        repository::open(&self.pool, tenant, messages).await
+    }
+
+    pub(crate) async fn score(
+        &self,
+        decision_id: i64,
         message: &IncomingMessage,
         state: &str,
     ) -> Result<Decision, AppError> {
@@ -60,7 +68,7 @@ impl Decisions {
             .map_err(AppError::Provider)?;
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
         let chosen = category::action(&hits(&categories, self.threshold));
-        repository::write_ready(&self.pool, tenant, message, chosen, &categories).await?;
+        repository::write_ready(&self.pool, decision_id, chosen, &categories).await?;
         Ok(Decision {
             message_id: message.message_id.clone(),
             status: Status::Ready,
@@ -69,20 +77,8 @@ impl Decisions {
         })
     }
 
-    pub(crate) async fn mark_pending(
-        &self,
-        tenant: &str,
-        message: &IncomingMessage,
-    ) -> Result<(), AppError> {
-        repository::mark_pending(&self.pool, tenant, message).await
-    }
-
-    pub(crate) async fn mark_failed(
-        &self,
-        tenant: &str,
-        message: &IncomingMessage,
-    ) -> Result<(), AppError> {
-        repository::mark_failed(&self.pool, tenant, message).await
+    pub(crate) async fn mark_failed(&self, decision_id: i64) -> Result<(), AppError> {
+        repository::mark_failed(&self.pool, decision_id).await
     }
 
     pub(crate) async fn list(
@@ -93,6 +89,7 @@ impl Decisions {
         user_id: Option<&str>,
         after: Option<i64>,
         category: Option<&str>,
+        limit: i64,
     ) -> Result<Vec<Decision>, AppError> {
         let category = category.map(Category::parse).transpose()?;
         if room.trim().is_empty() {
@@ -107,9 +104,15 @@ impl Decisions {
             after,
             category.map(Category::key),
             self.threshold,
+            &category_names(),
+            limit,
         )
         .await
     }
+}
+
+fn category_names() -> Vec<String> {
+    Category::ALL.into_iter().map(Category::key).collect()
 }
 
 fn message_questions() -> Questions {

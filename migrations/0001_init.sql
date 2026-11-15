@@ -13,22 +13,24 @@ CREATE TABLE messages (
 CREATE INDEX messages_tenant_room_timestamp_idx ON messages (tenant_id, room_id, timestamp DESC);
 
 CREATE TABLE decisions (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     status TEXT NOT NULL,
     action TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, message_id)
+    FOREIGN KEY (tenant_id, message_id)
+        REFERENCES messages (tenant_id, message_id)
 );
 
+CREATE INDEX decisions_message_idx ON decisions (tenant_id, message_id, id DESC);
+
 CREATE TABLE decision_scores (
-    tenant_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
+    decision_id BIGINT NOT NULL,
     category TEXT NOT NULL,
     score DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (tenant_id, message_id, category),
-    FOREIGN KEY (tenant_id, message_id)
-        REFERENCES decisions (tenant_id, message_id)
+    PRIMARY KEY (decision_id, category),
+    FOREIGN KEY (decision_id) REFERENCES decisions (id)
 );
 
 CREATE TABLE webhook_endpoints (
