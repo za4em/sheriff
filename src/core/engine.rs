@@ -1,0 +1,399 @@
+use std::collections::BTreeMap;
+
+use sqlx::PgPool;
+use tokio::sync::mpsc;
+
+use super::decisions::Decision;
+use super::messages::IncomingMessage;
+use super::provider::{JUDGED, Provider};
+use super::{decisions::Decisions, messages::Messages, webhooks::Webhooks};
+use crate::error::AppError;
+use serde::Serialize;
+
+type RoomWindows = BTreeMap<String, Vec<IncomingMessage>>;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub(crate) enum Score {
+    Ready(Decision),
+    Failed { message_id: String, error: String },
+}
+
+pub(crate) type ScoreReply = mpsc::UnboundedSender<Score>;
+
+struct Job {
+    tenant: Option<String>,
+    messages: Vec<IncomingMessage>,
+    windows: RoomWindows,
+    decision_ids: Vec<i64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Engine {
+    pub(crate) messages: Messages,
+    pub(crate) decisions: Decisions,
+    pub(crate) webhooks: Webhooks,
+}
+
+impl Engine {
+    pub(crate) fn new(
+        pool: PgPool,
+        provider: Provider,
+        window: i64,
+        threshold: f64,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            messages: Messages::new(pool.clone(), window),
+            decisions: Decisions::new(pool.clone(), provider, threshold),
+            webhooks: Webhooks::new(pool)?,
+        })
+    }
+
+    pub(crate) async fn score(
+        &self,
+        messages: Vec<IncomingMessage>,
+    ) -> Result<Vec<Score>, AppError> {
+        let job = self.prepare(None, messages).await?;
+        if job.messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.spawn(job, None).await {
+            Ok(scores) => Ok(scores),
+            Err(err) => {
+                tracing::error!(error = %err, "worker stopped");
+                Err(AppError::Database {
+                    action: "running the worker",
+                })
+            }
+        }
+    }
+
+    /// `reply`, when set, receives each score as that message finishes.
+    pub(crate) async fn submit(
+        &self,
+        tenant: &str,
+        messages: Vec<IncomingMessage>,
+        reply: Option<ScoreReply>,
+    ) -> Result<(), AppError> {
+        let job = self.prepare(Some(tenant), messages).await?;
+        if job.messages.is_empty() {
+            return Ok(());
+        }
+        self.spawn(job, reply);
+        Ok(())
+    }
+
+    /// Pass a tenant to save the batch on that profile.
+    async fn prepare(
+        &self,
+        tenant: Option<&str>,
+        messages: Vec<IncomingMessage>,
+    ) -> Result<Job, AppError> {
+        validate_all(&messages)?;
+        let mut windows = RoomWindows::new();
+        let mut decision_ids = Vec::new();
+        if !messages.is_empty()
+            && let Some(tenant) = tenant
+        {
+            windows = self.windows(tenant, &messages).await?;
+            self.upsert_all(tenant, &messages).await?;
+            decision_ids = self.decisions.open(tenant, &messages).await?;
+        }
+        Ok(Job {
+            tenant: tenant.map(str::to_owned),
+            messages,
+            windows,
+            decision_ids,
+        })
+    }
+
+    fn spawn(&self, job: Job, reply: Option<ScoreReply>) -> tokio::task::JoinHandle<Vec<Score>> {
+        let engine = self.clone();
+        tokio::spawn(async move { engine.finish(job, reply).await })
+    }
+
+    async fn finish(&self, job: Job, reply: Option<ScoreReply>) -> Vec<Score> {
+        let mut scores = Vec::with_capacity(job.messages.len());
+        for (index, message) in job.messages.iter().enumerate() {
+            let state = state(&job.windows, &job.messages, index);
+            let result = self.decisions.score(message, &state).await;
+            if let Some(tenant) = &job.tenant {
+                let score = self.record(message, job.decision_ids[index], result).await;
+                self.deliver(tenant, &score, reply.as_ref()).await;
+                scores.push(score);
+            } else {
+                scores.push(ready_or_failed(message, result));
+            }
+        }
+        scores
+    }
+
+    async fn record(
+        &self,
+        message: &IncomingMessage,
+        decision_id: i64,
+        result: Result<Decision, AppError>,
+    ) -> Score {
+        match self.store(decision_id, result).await {
+            Ok(decision) => Score::Ready(decision),
+            Err(err) => {
+                if let Err(mark_err) = self.decisions.mark_failed(decision_id).await {
+                    log_background(&mark_err);
+                }
+                log_background(&err);
+                Score::Failed {
+                    message_id: message.message_id.clone(),
+                    error: err.to_string(),
+                }
+            }
+        }
+    }
+
+    async fn store(
+        &self,
+        decision_id: i64,
+        result: Result<Decision, AppError>,
+    ) -> Result<Decision, AppError> {
+        let decision = result?;
+        self.decisions.write_ready(decision_id, &decision).await?;
+        Ok(decision)
+    }
+
+    async fn deliver(&self, tenant: &str, score: &Score, reply: Option<&ScoreReply>) {
+        if let Some(reply) = reply {
+            let _ = reply.send(score.clone());
+        }
+        if let Score::Ready(decision) = score {
+            if let Err(err) = self.webhooks.deliver_decision(tenant, decision).await {
+                log_background(&err);
+            }
+        }
+    }
+
+    async fn windows(
+        &self,
+        tenant: &str,
+        messages: &[IncomingMessage],
+    ) -> Result<RoomWindows, AppError> {
+        let mut rooms = Vec::new();
+        for message in messages {
+            if !rooms.iter().any(|room: &String| room == &message.room_id) {
+                rooms.push(message.room_id.clone());
+            }
+        }
+        let mut windows = RoomWindows::new();
+        for room in rooms {
+            let window = self.messages.window(tenant, &room).await?;
+            windows.insert(room, window);
+        }
+        Ok(windows)
+    }
+
+    async fn upsert_all(&self, tenant: &str, messages: &[IncomingMessage]) -> Result<(), AppError> {
+        for message in messages {
+            self.messages.upsert(tenant, message).await?;
+        }
+        Ok(())
+    }
+}
+
+fn ready_or_failed(message: &IncomingMessage, result: Result<Decision, AppError>) -> Score {
+    match result {
+        Ok(decision) => Score::Ready(decision),
+        Err(err) => Score::Failed {
+            message_id: message.message_id.clone(),
+            error: err.to_string(),
+        },
+    }
+}
+
+fn state(windows: &RoomWindows, messages: &[IncomingMessage], index: usize) -> String {
+    let window = context(
+        windows
+            .get(&messages[index].room_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        messages,
+        index,
+    );
+    lines(&window, &messages[index].message_id)
+}
+
+fn context(
+    prior: &[IncomingMessage],
+    batch: &[IncomingMessage],
+    index: usize,
+) -> Vec<IncomingMessage> {
+    let room = &batch[index].room_id;
+    let mut window = prior.to_vec();
+    for message in batch[..=index]
+        .iter()
+        .filter(|message| &message.room_id == room)
+    {
+        if let Some(existing) = window
+            .iter_mut()
+            .find(|row| row.message_id == message.message_id)
+        {
+            *existing = message.clone();
+        } else {
+            window.push(message.clone());
+        }
+    }
+    window
+}
+
+fn validate_all(messages: &[IncomingMessage]) -> Result<(), AppError> {
+    for message in messages {
+        validate(message)?;
+    }
+    Ok(())
+}
+
+fn validate(message: &IncomingMessage) -> Result<(), AppError> {
+    for (field, value) in [
+        ("message_id", message.message_id.as_str()),
+        ("room_id", message.room_id.as_str()),
+        ("user_id", message.user_id.as_str()),
+        ("text", message.text.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(AppError::MessageIncomplete { field });
+        }
+    }
+    Ok(())
+}
+
+fn lines(messages: &[IncomingMessage], judged_id: &str) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let mark = if message.message_id == judged_id {
+                JUDGED
+            } else {
+                ""
+            };
+            format!("{mark}{}: {}", message.user_id, message.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn log_background(err: &AppError) {
+    match err {
+        AppError::Database { action } => tracing::error!(action, "background submit failed"),
+        AppError::Provider(fault) => {
+            tracing::error!(fault = ?fault, "background submit failed")
+        }
+        AppError::MessageIncomplete { field } => {
+            tracing::error!(field, "background submit failed")
+        }
+        AppError::Unauthorized
+        | AppError::InvalidMessage
+        | AppError::UnknownCategory
+        | AppError::WebhookUrlRequired
+        | AppError::WebhookUrlInvalid
+        | AppError::WebhookEncode
+        | AppError::InvalidLimit => tracing::error!("background submit failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(message_id: &str, room_id: &str, user_id: &str, text: &str) -> IncomingMessage {
+        IncomingMessage {
+            message_id: message_id.to_owned(),
+            room_id: room_id.to_owned(),
+            user_id: user_id.to_owned(),
+            text: text.to_owned(),
+            timestamp: 1,
+            reply_to: None,
+            meta: json!({}),
+        }
+    }
+
+    #[test]
+    fn empty_ids_and_text_are_incomplete() {
+        for (field, message) in [
+            ("message_id", message("  ", "r", "u", "hi")),
+            ("room_id", message("m", "", "u", "hi")),
+            ("user_id", message("m", "r", " ", "hi")),
+            ("text", message("m", "r", "u", "   ")),
+        ] {
+            assert!(matches!(
+                validate(&message),
+                Err(AppError::MessageIncomplete { field: got }) if got == field
+            ));
+        }
+        assert!(validate(&message("m", "r", "u", "hi")).is_ok());
+    }
+
+    #[test]
+    fn state_marks_only_the_message_being_judged() {
+        let messages = vec![
+            message("m1", "r", "u1", "you're an idiot"),
+            message("m2", "r", "u2", "hello"),
+            message("m3", "r", "u3", "ok"),
+        ];
+        assert_eq!(
+            lines(&messages, "m2"),
+            "u1: you're an idiot\n[this] u2: hello\nu3: ok"
+        );
+    }
+
+    #[test]
+    fn the_batch_is_applied_onto_the_room_in_order() {
+        let prior = vec![at(message("m0", "r", "u0", "earlier"), 1)];
+        let batch = vec![
+            at(message("m1", "r", "u1", "you're an idiot"), 3),
+            at(message("m2", "r", "u2", "hello"), 4),
+            at(message("m3", "other", "u1", "ok"), 5),
+            at(message("m4", "r", "u1", "idiot"), 6),
+        ];
+        assert_eq!(
+            lines(&context(&prior, &batch, 0), "m1"),
+            "u0: earlier\n[this] u1: you're an idiot"
+        );
+        assert_eq!(
+            lines(&context(&prior, &batch, 1), "m2"),
+            "u0: earlier\nu1: you're an idiot\n[this] u2: hello"
+        );
+        assert_eq!(lines(&context(&[], &batch, 2), "m3"), "[this] u1: ok");
+        let fourth = context(&prior, &batch, 3);
+        assert!(fourth.iter().any(|message| message.message_id == "m1"));
+        assert!(fourth.iter().any(|message| message.message_id == "m2"));
+        assert!(fourth.iter().all(|message| message.room_id == "r"));
+    }
+
+    #[test]
+    fn an_incoming_line_replaces_the_stored_copy() {
+        let prior = vec![at(message("m1", "r", "u1", "old"), 1)];
+        let batch = vec![
+            at(message("m1", "r", "u1", "first"), 2),
+            at(message("m1", "r", "u1", "second"), 3),
+        ];
+        let window = context(&prior, &batch, 1);
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].text, "second");
+    }
+
+    #[test]
+    fn the_batch_is_appended_in_request_order() {
+        let prior = vec![at(message("m0", "r", "u0", "stored"), 5)];
+        let batch = vec![
+            at(message("m1", "r", "u1", "first"), 1),
+            at(message("m2", "r", "u2", "second"), 9),
+        ];
+        assert_eq!(
+            lines(&context(&prior, &batch, 1), "m2"),
+            "u0: stored\nu1: first\n[this] u2: second"
+        );
+    }
+
+    fn at(mut message: IncomingMessage, timestamp: i64) -> IncomingMessage {
+        message.timestamp = timestamp;
+        message
+    }
+}
