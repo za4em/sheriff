@@ -8,11 +8,16 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 use super::tenant::Tenant;
 use crate::{
     app::App,
-    core::{Engine, messages::IncomingMessage},
+    core::{
+        Engine,
+        engine::{Score, ScoreReply},
+        messages::IncomingMessage,
+    },
     error::AppError,
 };
 
@@ -31,19 +36,32 @@ async fn stream(
 }
 
 async fn session(mut socket: WebSocket, engine: Engine, tenant_id: String) {
+    let (reply, mut scores) = mpsc::unbounded_channel::<Score>();
     loop {
-        let Some(frame) = socket.recv().await else {
-            break;
-        };
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(err) => {
-                tracing::debug!(error = %err, "websocket closed");
-                break;
+        tokio::select! {
+            frame = socket.recv() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "websocket closed");
+                        break;
+                    }
+                };
+                if !handle_frame(&mut socket, &engine, &tenant_id, &reply, frame).await {
+                    break;
+                }
             }
-        };
-        if !handle_frame(&mut socket, &engine, &tenant_id, frame).await {
-            break;
+            score = scores.recv() => {
+                let Some(score) = score else {
+                    break;
+                };
+                if !send_json(&mut socket, &score).await {
+                    break;
+                }
+            }
         }
     }
 }
@@ -52,11 +70,15 @@ async fn handle_frame(
     socket: &mut WebSocket,
     engine: &Engine,
     tenant_id: &str,
+    reply: &ScoreReply,
     frame: Message,
 ) -> bool {
     match frame {
         Message::Text(text) => match serde_json::from_str::<Vec<IncomingMessage>>(text.as_str()) {
-            Ok(messages) => match engine.submit(tenant_id, messages).await {
+            Ok(messages) => match engine
+                .submit(tenant_id, messages, Some(reply.clone()))
+                .await
+            {
                 Ok(()) => true,
                 Err(err) => send_error(socket, &err).await,
             },

@@ -12,6 +12,6 @@ async fn post_messages(
     State(app): State<App>,
     Json(messages): Json<Vec<IncomingMessage>>,
 ) -> Result<StatusCode, AppError> {
-    app.engine.submit(&tenant.id, messages).await?;
+    app.engine.submit(&tenant.id, messages, None).await?;
     Ok(StatusCode::ACCEPTED)
 }

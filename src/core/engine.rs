@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 
 use super::decisions::Decision;
 use super::messages::IncomingMessage;
@@ -11,18 +12,20 @@ use serde::Serialize;
 
 type RoomWindows = BTreeMap<String, Vec<IncomingMessage>>;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub(crate) enum Score {
     Ready(Decision),
     Failed { message_id: String, error: String },
 }
 
+pub(crate) type ScoreReply = mpsc::UnboundedSender<Score>;
+
 struct Job {
     tenant: Option<String>,
     messages: Vec<IncomingMessage>,
     windows: RoomWindows,
-    ids: Vec<i64>,
+    decision_ids: Vec<i64>,
 }
 
 #[derive(Clone)]
@@ -54,7 +57,7 @@ impl Engine {
         if job.messages.is_empty() {
             return Ok(Vec::new());
         }
-        match self.spawn(job).await {
+        match self.spawn(job, None).await {
             Ok(scores) => Ok(scores),
             Err(err) => {
                 tracing::error!(error = %err, "worker stopped");
@@ -65,16 +68,18 @@ impl Engine {
         }
     }
 
+    /// `reply`, when set, receives each score as that message finishes.
     pub(crate) async fn submit(
         &self,
         tenant: &str,
         messages: Vec<IncomingMessage>,
+        reply: Option<ScoreReply>,
     ) -> Result<(), AppError> {
         let job = self.prepare(Some(tenant), messages).await?;
         if job.messages.is_empty() {
             return Ok(());
         }
-        self.spawn(job);
+        self.spawn(job, reply);
         Ok(())
     }
 
@@ -86,72 +91,82 @@ impl Engine {
     ) -> Result<Job, AppError> {
         validate_all(&messages)?;
         let mut windows = RoomWindows::new();
-        let mut ids = Vec::new();
+        let mut decision_ids = Vec::new();
         if !messages.is_empty()
             && let Some(tenant) = tenant
         {
             windows = self.windows(tenant, &messages).await?;
             self.upsert_all(tenant, &messages).await?;
-            ids = self.decisions.open(tenant, &messages).await?;
+            decision_ids = self.decisions.open(tenant, &messages).await?;
         }
         Ok(Job {
             tenant: tenant.map(str::to_owned),
             messages,
             windows,
-            ids,
+            decision_ids,
         })
     }
 
-    fn spawn(&self, job: Job) -> tokio::task::JoinHandle<Vec<Score>> {
+    fn spawn(&self, job: Job, reply: Option<ScoreReply>) -> tokio::task::JoinHandle<Vec<Score>> {
         let engine = self.clone();
-        tokio::spawn(async move { engine.finish(job).await })
+        tokio::spawn(async move { engine.finish(job, reply).await })
     }
 
-    async fn finish(&self, job: Job) -> Vec<Score> {
+    async fn finish(&self, job: Job, reply: Option<ScoreReply>) -> Vec<Score> {
         let mut scores = Vec::with_capacity(job.messages.len());
         for (index, message) in job.messages.iter().enumerate() {
             let state = state(&job.windows, &job.messages, index);
-            let mut scored = self.decisions.score(message, &state).await;
+            let result = self.decisions.score(message, &state).await;
             if let Some(tenant) = &job.tenant {
-                let id = job.ids[index];
-                scored = self.store(id, scored).await;
-                scored = self.apply(tenant, id, scored).await;
+                let score = self.record(message, job.decision_ids[index], result).await;
+                self.deliver(tenant, &score, reply.as_ref()).await;
+                scores.push(score);
+            } else {
+                scores.push(ready_or_failed(message, result));
             }
-            scores.push(scored_message(message, scored));
         }
         scores
     }
 
-    async fn store(
+    async fn record(
         &self,
-        id: i64,
-        scored: Result<Decision, AppError>,
-    ) -> Result<Decision, AppError> {
-        let decision = scored?;
-        self.decisions.write_ready(id, &decision).await?;
-        Ok(decision)
-    }
-
-    async fn apply(
-        &self,
-        tenant: &str,
-        id: i64,
-        scored: Result<Decision, AppError>,
-    ) -> Result<Decision, AppError> {
-        match scored {
-            Ok(decision) => {
-                if let Err(err) = self.webhooks.deliver_decision(tenant, &decision).await {
-                    log_background(&err);
-                }
-                Ok(decision)
-            }
+        message: &IncomingMessage,
+        decision_id: i64,
+        result: Result<Decision, AppError>,
+    ) -> Score {
+        match self.store(decision_id, result).await {
+            Ok(decision) => Score::Ready(decision),
             Err(err) => {
-                if let Err(mark_err) = self.decisions.mark_failed(id).await {
+                if let Err(mark_err) = self.decisions.mark_failed(decision_id).await {
                     log_background(&mark_err);
                 }
                 log_background(&err);
-                Err(err)
+                Score::Failed {
+                    message_id: message.message_id.clone(),
+                    error: err.to_string(),
+                }
             }
+        }
+    }
+
+    async fn store(
+        &self,
+        decision_id: i64,
+        result: Result<Decision, AppError>,
+    ) -> Result<Decision, AppError> {
+        let decision = result?;
+        self.decisions.write_ready(decision_id, &decision).await?;
+        Ok(decision)
+    }
+
+    async fn deliver(&self, tenant: &str, score: &Score, reply: Option<&ScoreReply>) {
+        if let Score::Ready(decision) = score {
+            if let Err(err) = self.webhooks.deliver_decision(tenant, decision).await {
+                log_background(&err);
+            }
+        }
+        if let Some(reply) = reply {
+            let _ = reply.send(score.clone());
         }
     }
 
@@ -182,8 +197,8 @@ impl Engine {
     }
 }
 
-fn scored_message(message: &IncomingMessage, scored: Result<Decision, AppError>) -> Score {
-    match scored {
+fn ready_or_failed(message: &IncomingMessage, result: Result<Decision, AppError>) -> Score {
+    match result {
         Ok(decision) => Score::Ready(decision),
         Err(err) => Score::Failed {
             message_id: message.message_id.clone(),
