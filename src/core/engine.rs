@@ -160,13 +160,13 @@ impl Engine {
     }
 
     async fn deliver(&self, tenant: &str, score: &Score, reply: Option<&ScoreReply>) {
+        if let Some(reply) = reply {
+            let _ = reply.send(score.clone());
+        }
         if let Score::Ready(decision) = score {
             if let Err(err) = self.webhooks.deliver_decision(tenant, decision).await {
                 log_background(&err);
             }
-        }
-        if let Some(reply) = reply {
-            let _ = reply.send(score.clone());
         }
     }
 
