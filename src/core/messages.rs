@@ -8,7 +8,10 @@ use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, sqlx::FromRow)]
 pub(crate) struct IncomingMessage {
-    pub(crate) message_id: String,
+    #[serde(default, skip_serializing)]
+    pub(crate) id: i64,
+    #[serde(rename = "message_id")]
+    pub(crate) client_message_id: String,
     pub(crate) room_id: String,
     pub(crate) user_id: String,
     pub(crate) text: String,
@@ -30,22 +33,33 @@ impl Messages {
         Self { pool, window }
     }
 
-    pub(crate) async fn upsert(
-        &self,
+    pub(crate) async fn insert(
+        connection: &mut sqlx::PgConnection,
         tenant: &str,
         message: &IncomingMessage,
-    ) -> Result<(), AppError> {
-        repository::upsert(&self.pool, tenant, message).await
+        retained: bool,
+    ) -> Result<IncomingMessage, AppError> {
+        repository::insert(connection, tenant, message, retained).await
     }
 
-    pub(crate) async fn window(
+    pub(crate) async fn room(
         &self,
         tenant: &str,
         room: &str,
     ) -> Result<Vec<IncomingMessage>, AppError> {
-        let mut messages = repository::window(&self.pool, tenant, room, self.window).await?;
-        messages.reverse();
-        Ok(messages)
+        repository::room(&self.pool, tenant, room, self.window).await
+    }
+
+    pub(crate) async fn get_many(
+        &self,
+        tenant: &str,
+        ids: &[i64],
+    ) -> Result<Vec<IncomingMessage>, AppError> {
+        repository::get_many(&self.pool, tenant, ids).await
+    }
+
+    pub(crate) async fn is_retained(&self, id: i64) -> Result<bool, AppError> {
+        repository::is_retained(&self.pool, id).await
     }
 }
 
@@ -64,7 +78,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_id, "m1");
+        assert_eq!(messages[0].client_message_id, "m1");
         assert_eq!(messages[0].reply_to, None);
         assert!(messages[0].meta.as_object().unwrap().is_empty());
     }
