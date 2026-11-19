@@ -18,12 +18,18 @@ pub(crate) enum AppError {
     WebhookEncode,
     InvalidLimit,
     Database { action: &'static str },
+    Queue { action: &'static str },
     Provider(Fault),
 }
 
 pub(crate) fn database(action: &'static str, err: impl Display) -> AppError {
     tracing::error!(error = %err, "database failed while {action}");
     AppError::Database { action }
+}
+
+pub(crate) fn queue(action: &'static str, err: impl Display) -> AppError {
+    tracing::error!(error = %err, "queue failed while {action}");
+    AppError::Queue { action }
 }
 
 impl Display for AppError {
@@ -49,7 +55,9 @@ fn status(err: &AppError) -> StatusCode {
         | AppError::WebhookUrlRequired
         | AppError::WebhookUrlInvalid
         | AppError::InvalidLimit => StatusCode::BAD_REQUEST,
-        AppError::WebhookEncode | AppError::Database { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        AppError::WebhookEncode | AppError::Database { .. } | AppError::Queue { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
         AppError::Provider(_) => StatusCode::BAD_GATEWAY,
     }
 }
@@ -73,6 +81,7 @@ fn client_message(err: &AppError) -> String {
         AppError::WebhookEncode => "A webhook body could not be encoded.".to_owned(),
         AppError::InvalidLimit => "A limit must be from 1 to 100.".to_owned(),
         AppError::Database { action } => format!("The database failed while {action}."),
+        AppError::Queue { action } => format!("The queue failed while {action}."),
         AppError::Provider(fault) => {
             format!(
                 "Could not decide on the message. {}",
