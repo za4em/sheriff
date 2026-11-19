@@ -9,6 +9,8 @@ pub struct Config {
     pub(crate) api_key: String,
     pub(crate) window: i64,
     pub(crate) threshold: f64,
+    pub(crate) workers: usize,
+    pub(crate) rabbitmq_url: String,
 }
 
 pub struct ServerConfig {
@@ -22,23 +24,26 @@ pub(crate) struct DatabaseConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let workers = workers()?;
         Ok(Self {
             server: ServerConfig {
                 bind_address: "0.0.0.0:3000".to_owned(),
             },
             database: DatabaseConfig {
                 url: required("DATABASE_URL")?,
-                pool_size: 5,
+                pool_size: 20,
             },
-            provider: provider()?,
+            provider: provider(workers)?,
             api_key: required("SHERIFF_API_KEY")?,
             window: window()?,
             threshold: threshold()?,
+            workers,
+            rabbitmq_url: required("RABBITMQ_URL")?,
         })
     }
 }
 
-fn provider() -> Result<ProviderConfig, Box<dyn Error>> {
+fn provider(workers: usize) -> Result<ProviderConfig, Box<dyn Error>> {
     match var_or("SHERIFF_PROVIDER", "mock").as_str() {
         "mock" => Ok(ProviderConfig::Mock {
             latency: millis("SHERIFF_PROVIDER_LATENCY_MS", 0)?,
@@ -53,7 +58,7 @@ fn provider() -> Result<ProviderConfig, Box<dyn Error>> {
                 model: required("SHERIFF_PROVIDER_MODEL")?,
                 api_key: required("SHERIFF_PROVIDER_API_KEY")?,
                 timeout,
-                max_concurrency: concurrency()?,
+                max_concurrency: workers,
             })
         }
         other => Err(format!("SHERIFF_PROVIDER must be mock or decision_api, not {other}").into()),
@@ -82,13 +87,13 @@ fn window() -> Result<i64, Box<dyn Error>> {
     Ok(value)
 }
 
-fn concurrency() -> Result<usize, Box<dyn Error>> {
-    let raw = var_or("SHERIFF_PROVIDER_MAX_CONCURRENCY", "64");
+fn workers() -> Result<usize, Box<dyn Error>> {
+    let raw = var_or("SHERIFF_WORKERS", "100");
     let value: usize = raw
         .parse()
-        .map_err(|_| "SHERIFF_PROVIDER_MAX_CONCURRENCY must be a number".to_owned())?;
+        .map_err(|_| "SHERIFF_WORKERS must be a number".to_owned())?;
     if value == 0 {
-        return Err("SHERIFF_PROVIDER_MAX_CONCURRENCY must be greater than 0".into());
+        return Err("SHERIFF_WORKERS must be greater than 0".into());
     }
     Ok(value)
 }
