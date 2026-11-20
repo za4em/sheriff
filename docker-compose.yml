@@ -15,6 +15,18 @@ services:
       timeout: 5s
       retries: 20
 
+  cache:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - cache:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   queue:
     image: rabbitmq:4-management-alpine
     ports:
@@ -33,4 +45,5 @@ services:
 
 volumes:
   postgres:
+  cache:
   queue:
