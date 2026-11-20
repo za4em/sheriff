@@ -1,6 +1,7 @@
 mod repository;
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -90,11 +91,10 @@ impl Decisions {
 
     pub(crate) async fn score(&self, state: &str) -> Result<(Action, CategoryScores), AppError> {
         let questions = message_questions();
-        let probabilities = self
-            .provider
-            .decide(state, &questions)
-            .await
-            .map_err(AppError::Provider)?;
+        let started = Instant::now();
+        let decided = self.provider.decide(state, &questions).await;
+        self.metrics.observe_provider(started.elapsed());
+        let probabilities = decided.map_err(AppError::Provider)?;
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
         let chosen = category::action(&hits(&categories, self.threshold));
         Ok((chosen, categories))
