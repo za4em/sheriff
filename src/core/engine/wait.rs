@@ -12,9 +12,10 @@ pub(super) enum Waiter {
     Socket(SocketSender),
 }
 
-/// In-process waiters for a decision id. Postgres holds the result.
+/// Waiters for a decision id on this instance. Postgres holds the result.
 ///
-/// One Sheriff process only: a worker on another process cannot see this map.
+/// The socket and the `/v1/score` call stay here. A worker on any instance
+/// records the id when the row is ready.
 #[derive(Clone, Default)]
 pub(super) struct WaitList {
     pending: Arc<Mutex<HashMap<i64, Waiter>>>,

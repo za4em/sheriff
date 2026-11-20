@@ -1,24 +1,17 @@
-use tokio::sync::mpsc;
-
-use super::FinishedDecision;
+use crate::core::cache::Cache;
 use crate::core::decisions::{Decision, Decisions, Status};
 use crate::core::messages::{Message, Messages};
 use crate::core::provider::JUDGED;
 use crate::core::queue::{Jobs, REQUEUE_PAUSE, ScoreJob};
 use crate::error::AppError;
 
-pub(super) async fn work(
-    jobs: Jobs,
-    decisions: Decisions,
-    messages: Messages,
-    finished: mpsc::UnboundedSender<FinishedDecision>,
-) {
+pub(super) async fn work(jobs: Jobs, decisions: Decisions, messages: Messages, cache: Cache) {
     loop {
         let Some(delivery) = jobs.recv().await else {
             return;
         };
         let decision_id = delivery.job.decision_id;
-        match run(&delivery.job, &decisions, &messages, &finished).await {
+        match run(&delivery.job, &decisions, &messages, &cache).await {
             Ok(()) => {
                 if let Err(err) = delivery.ack().await {
                     tracing::error!(error = %err, decision_id, "score job could not be acknowledged");
@@ -39,18 +32,18 @@ async fn run(
     job: &ScoreJob,
     decisions: &Decisions,
     messages: &Messages,
-    finished: &mpsc::UnboundedSender<FinishedDecision>,
+    cache: &Cache,
 ) -> Result<(), AppError> {
     let Some(decision) = decisions.get(job.decision_id).await? else {
-        notify(finished, job.decision_id, false);
+        cache.ready_decision(job.decision_id, false).await?;
         return Ok(());
     };
     if decision.status != Status::Pending {
-        notify(finished, decision.id, false);
+        cache.ready_decision(decision.id, false).await?;
         return Ok(());
     }
     let completed_now = score_message(decisions, messages, &decision).await?;
-    notify(finished, decision.id, completed_now);
+    cache.ready_decision(decision.id, completed_now).await?;
     Ok(())
 }
 
@@ -79,25 +72,6 @@ async fn score_message(
     match decisions.score(&lines).await {
         Ok((action, categories)) => decisions.mark_ready(decision.id, action, &categories).await,
         Err(err) => decisions.mark_failed(decision.id, &err.to_string()).await,
-    }
-}
-
-fn notify(
-    finished: &mpsc::UnboundedSender<FinishedDecision>,
-    decision_id: i64,
-    completed_now: bool,
-) {
-    if finished
-        .send(FinishedDecision {
-            decision_id,
-            completed_now,
-        })
-        .is_err()
-    {
-        tracing::error!(
-            decision_id,
-            "the observer stopped before a decision was delivered"
-        );
     }
 }
 
