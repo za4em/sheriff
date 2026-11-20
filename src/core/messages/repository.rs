@@ -1,4 +1,4 @@
-use super::IncomingMessage;
+use super::{IncomingMessage, Message};
 use crate::error::{AppError, database};
 
 pub(super) async fn insert(
@@ -6,7 +6,7 @@ pub(super) async fn insert(
     tenant: &str,
     message: &IncomingMessage,
     retained: bool,
-) -> Result<IncomingMessage, AppError> {
+) -> Result<Message, AppError> {
     sqlx::query_as(
         r#"
         INSERT INTO messages (
@@ -14,7 +14,7 @@ pub(super) async fn insert(
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9
         )
-        RETURNING id, client_message_id, room_id, user_id, text, timestamp, reply_to, meta
+        RETURNING id, room_id, user_id, text
         "#,
     )
     .bind(tenant)
@@ -36,10 +36,10 @@ pub(super) async fn room(
     tenant: &str,
     room: &str,
     limit: i64,
-) -> Result<Vec<IncomingMessage>, AppError> {
+) -> Result<Vec<Message>, AppError> {
     sqlx::query_as(
         r#"
-        SELECT id, client_message_id, room_id, user_id, text, timestamp, reply_to, meta
+        SELECT id, room_id, user_id, text
         FROM (
             SELECT *
             FROM messages
@@ -64,13 +64,13 @@ pub(super) async fn get_many(
     pool: &sqlx::PgPool,
     tenant: &str,
     ids: &[i64],
-) -> Result<Vec<IncomingMessage>, AppError> {
+) -> Result<Vec<Message>, AppError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     sqlx::query_as(
         r#"
-        SELECT m.id, m.client_message_id, m.room_id, m.user_id, m.text, m.timestamp, m.reply_to, m.meta
+        SELECT m.id, m.room_id, m.user_id, m.text
         FROM unnest($2::bigint[]) WITH ORDINALITY AS wanted(id, ord)
         JOIN messages m
           ON m.tenant_id = $1
