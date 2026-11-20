@@ -74,7 +74,10 @@ impl Engine {
             let decisions = self.decisions.clone();
             let messages = self.messages.clone();
             let cache = self.cache.clone();
-            tokio::spawn(async move { worker::work(jobs, decisions, messages, cache).await });
+            let metrics = self.metrics.clone();
+            tokio::spawn(
+                async move { worker::work(jobs, decisions, messages, cache, metrics).await },
+            );
         }
     }
 

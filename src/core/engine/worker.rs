@@ -4,8 +4,15 @@ use crate::core::messages::{Message, Messages};
 use crate::core::provider::JUDGED;
 use crate::core::queue::{Jobs, REQUEUE_PAUSE, ScoreJob};
 use crate::error::AppError;
+use crate::metrics::Metrics;
 
-pub(super) async fn work(jobs: Jobs, decisions: Decisions, messages: Messages, cache: Cache) {
+pub(super) async fn work(
+    jobs: Jobs,
+    decisions: Decisions,
+    messages: Messages,
+    cache: Cache,
+    metrics: Metrics,
+) {
     loop {
         let Some(delivery) = jobs.recv().await else {
             return;
@@ -22,6 +29,8 @@ pub(super) async fn work(jobs: Jobs, decisions: Decisions, messages: Messages, c
                 tokio::time::sleep(REQUEUE_PAUSE).await;
                 if let Err(err) = delivery.requeue().await {
                     tracing::error!(error = %err, "score job could not be requeued");
+                } else {
+                    metrics.retried();
                 }
             }
         }
