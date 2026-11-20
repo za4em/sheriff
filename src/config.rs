@@ -10,7 +10,9 @@ pub struct Config {
     pub(crate) window: i64,
     pub(crate) threshold: f64,
     pub(crate) workers: usize,
-    pub(crate) rabbitmq_url: String,
+    pub(crate) queue_url: String,
+    pub(crate) cache_url: String,
+    pub(crate) cache_limit: usize,
 }
 
 pub struct ServerConfig {
@@ -38,7 +40,9 @@ impl Config {
             window: window()?,
             threshold: threshold()?,
             workers,
-            rabbitmq_url: required("RABBITMQ_URL")?,
+            queue_url: required("QUEUE_URL")?,
+            cache_url: required("CACHE_URL")?,
+            cache_limit: cache_limit()?,
         })
     }
 }
@@ -83,6 +87,17 @@ fn window() -> Result<i64, Box<dyn Error>> {
         .map_err(|_| "SHERIFF_MESSAGES_WINDOW must be a number".to_owned())?;
     if value <= 0 {
         return Err("SHERIFF_MESSAGES_WINDOW must be greater than 0".into());
+    }
+    Ok(value)
+}
+
+fn cache_limit() -> Result<usize, Box<dyn Error>> {
+    let raw = var_or("SHERIFF_CACHE_LIMIT", "100000");
+    let value: usize = raw
+        .parse()
+        .map_err(|_| "SHERIFF_CACHE_LIMIT must be a number".to_owned())?;
+    if value == 0 {
+        return Err("SHERIFF_CACHE_LIMIT must be greater than 0".into());
     }
     Ok(value)
 }

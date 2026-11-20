@@ -4,6 +4,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 
+use super::cache::{Cache, ReadyDecision};
 use super::decisions::{Decision, Decisions, MessageWithContext};
 use super::messages::{IncomingMessage, Message, Messages};
 use super::provider::Provider;
@@ -19,11 +20,6 @@ use wait::{ScoreWait, WaitList, Waiter};
 
 pub(crate) type SocketSender = mpsc::UnboundedSender<Decision>;
 
-struct FinishedDecision {
-    decision_id: i64,
-    completed_now: bool,
-}
-
 const SCORE_WAIT: Duration = Duration::from_secs(5);
 
 type RoomWindows = BTreeMap<String, Vec<Message>>;
@@ -35,6 +31,7 @@ pub(crate) struct Engine {
     pub(crate) decisions: Decisions,
     pub(crate) webhooks: Webhooks,
     queue: Queue,
+    cache: Cache,
     waiting: WaitList,
 }
 
@@ -45,6 +42,7 @@ impl Engine {
         window: i64,
         threshold: f64,
         queue: Queue,
+        cache: Cache,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             pool: pool.clone(),
@@ -52,17 +50,18 @@ impl Engine {
             decisions: Decisions::new(pool.clone(), provider, threshold),
             webhooks: Webhooks::new(pool)?,
             queue,
+            cache,
             waiting: WaitList::default(),
         })
     }
 
     /// Workers score jobs. The observer delivers sockets and webhooks.
     /// The sweeper republishes pending decisions left behind by a crash.
-    pub(crate) fn serve(&self, workers: usize) {
-        let jobs = self.queue.clone().listen(workers);
-        let (finished_tx, finished_rx) = mpsc::unbounded_channel();
+    pub(crate) async fn serve(&self, workers: usize) {
+        let ready_decisions = self.cache.listen_decisions().await;
         let observer = self.clone();
-        tokio::spawn(async move { observer.observe(finished_rx).await });
+        tokio::spawn(async move { observer.observe(ready_decisions).await });
+        let jobs = self.queue.clone().listen(workers);
         let sweep_decisions = self.decisions.clone();
         let sweep_queue = self.queue.clone();
         tokio::spawn(async move { sweep::run(sweep_decisions, sweep_queue).await });
@@ -70,15 +69,15 @@ impl Engine {
             let jobs = jobs.clone();
             let decisions = self.decisions.clone();
             let messages = self.messages.clone();
-            let finished = finished_tx.clone();
-            tokio::spawn(async move { worker::work(jobs, decisions, messages, finished).await });
+            let cache = self.cache.clone();
+            tokio::spawn(async move { worker::work(jobs, decisions, messages, cache).await });
         }
     }
 
-    async fn observe(&self, mut incoming: mpsc::UnboundedReceiver<FinishedDecision>) {
-        while let Some(signal) = incoming.recv().await {
-            let waiter = self.waiting.take(signal.decision_id);
-            let decision = match self.decisions.get(signal.decision_id).await {
+    async fn observe(&self, mut incoming: mpsc::UnboundedReceiver<ReadyDecision>) {
+        while let Some(finished) = incoming.recv().await {
+            let waiter = self.waiting.take(finished.decision_id);
+            let decision = match self.decisions.get(finished.decision_id).await {
                 Ok(decision) => decision,
                 Err(err) => {
                     tracing::error!(error = %err, "background work failed");
@@ -99,11 +98,22 @@ impl Engine {
                 }
                 None => {}
             }
-            if signal.completed_now
+            if finished.completed_now
                 && let Some(decision) = decision
+                && self.claim_webhook(finished.decision_id).await
                 && let Err(err) = self.webhook(&decision).await
             {
                 tracing::error!(error = %err, "background work failed");
+            }
+        }
+    }
+
+    async fn claim_webhook(&self, decision_id: i64) -> bool {
+        match self.cache.claim_webhook(decision_id).await {
+            Ok(claimed) => claimed,
+            Err(err) => {
+                tracing::error!(error = %err, "background work failed");
+                false
             }
         }
     }
