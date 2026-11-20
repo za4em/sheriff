@@ -12,6 +12,17 @@ pub(crate) enum Action {
     Escalate,
 }
 
+impl Action {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Hide => "hide",
+            Self::Mute => "mute",
+            Self::Escalate => "escalate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Category {
