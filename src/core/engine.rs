@@ -13,16 +13,16 @@ use crate::error::{AppError, database, queue};
 mod wait;
 mod worker;
 
-use wait::{Notice, WaitList};
-
-type RoomWindows = BTreeMap<String, Vec<Message>>;
+use wait::{ScoreWait, WaitList, Waiter};
 
 pub(crate) type SocketSender = mpsc::UnboundedSender<Decision>;
 
-struct Signal {
+struct FinishedDecision {
     decision_id: i64,
-    fresh: bool,
+    completed_now: bool,
 }
+
+type RoomWindows = BTreeMap<String, Vec<Message>>;
 
 #[derive(Clone)]
 pub(crate) struct Engine {
@@ -52,69 +52,57 @@ impl Engine {
         })
     }
 
-    /// Starts the workers and the observer. The workers write decisions. The observer reads them.
-    pub(crate) async fn serve(&self, workers: usize) -> Result<(), AppError> {
-        self.queue.ready().await?;
-        let (signals, incoming) = mpsc::unbounded_channel();
-        let waiting = self.waiting.clone();
-        let decisions = self.decisions.clone();
-        let webhooks = self.webhooks.clone();
-        let messages = self.messages.clone();
-        tokio::spawn(async move {
-            Self::observe(incoming, waiting, decisions, messages, webhooks).await
-        });
+    /// Workers score jobs. The observer delivers sockets and webhooks.
+    pub(crate) fn serve(&self, workers: usize) {
+        let jobs = self.queue.clone().listen(workers);
+        let (finished_tx, finished_rx) = mpsc::unbounded_channel();
+        let observer = self.clone();
+        tokio::spawn(async move { observer.observe(finished_rx).await });
         for _ in 0..workers {
-            let queue = self.queue.clone();
+            let jobs = jobs.clone();
             let decisions = self.decisions.clone();
             let messages = self.messages.clone();
-            let signals = signals.clone();
-            tokio::spawn(async move { worker::work(queue, decisions, messages, signals).await });
+            let finished = finished_tx.clone();
+            tokio::spawn(async move { worker::work(jobs, decisions, messages, finished).await });
         }
-        Ok(())
     }
 
-    async fn observe(
-        mut incoming: mpsc::UnboundedReceiver<Signal>,
-        waiting: WaitList,
-        decisions: Decisions,
-        messages: Messages,
-        webhooks: Webhooks,
-    ) {
+    async fn observe(&self, mut incoming: mpsc::UnboundedReceiver<FinishedDecision>) {
         while let Some(signal) = incoming.recv().await {
-            let socket = match waiting.take(signal.decision_id) {
-                Some(Notice::Call(done)) => {
-                    let _ = done.send(());
-                    continue;
-                }
-                Some(Notice::Socket(socket)) => Some(socket),
-                None => None,
-            };
-            let decision = match decisions.get(signal.decision_id).await {
-                Ok(Some(decision)) => decision,
-                Ok(None) => continue,
+            let waiter = self.waiting.take(signal.decision_id);
+            let decision = match self.decisions.get(signal.decision_id).await {
+                Ok(decision) => decision,
                 Err(err) => {
-                    log_background(&err);
+                    tracing::error!(error = %err, "background work failed");
+                    if let Some(Waiter::Reply(done)) = waiter {
+                        let _ = done.send(());
+                    }
                     continue;
                 }
             };
-            if let Some(socket) = socket {
-                let _ = socket.send(decision.clone());
-            }
-            if signal.fresh {
-                if let Err(err) = Self::webhook(&messages, &webhooks, &decision).await {
-                    log_background(&err);
+            match waiter {
+                Some(Waiter::Reply(done)) => {
+                    let _ = done.send(());
                 }
+                Some(Waiter::Socket(socket)) => {
+                    if let Some(decision) = decision.clone() {
+                        let _ = socket.send(decision);
+                    }
+                }
+                None => {}
+            }
+            if signal.completed_now
+                && let Some(decision) = decision
+                && let Err(err) = self.webhook(&decision).await
+            {
+                tracing::error!(error = %err, "background work failed");
             }
         }
     }
 
-    async fn webhook(
-        messages: &Messages,
-        webhooks: &Webhooks,
-        decision: &Decision,
-    ) -> Result<(), AppError> {
-        if messages.is_retained(decision.message_id).await? {
-            webhooks
+    async fn webhook(&self, decision: &Decision) -> Result<(), AppError> {
+        if self.messages.is_retained(decision.message_row_id).await? {
+            self.webhooks
                 .deliver_decision(&decision.tenant, decision)
                 .await?;
         }

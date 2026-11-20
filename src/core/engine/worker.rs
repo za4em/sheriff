@@ -1,38 +1,36 @@
 use tokio::sync::mpsc;
 
-use super::Signal;
-use super::log_background;
+use super::FinishedDecision;
 use crate::core::decisions::{Decision, Decisions, Status};
 use crate::core::messages::{Message, Messages};
 use crate::core::provider::JUDGED;
-use crate::core::queue::{Queue, ScoreJob};
-use crate::error::{AppError, queue};
+use crate::core::queue::{Jobs, REQUEUE_PAUSE, ScoreJob};
+use crate::error::AppError;
 
 pub(super) async fn work(
-    queue: Queue,
+    jobs: Jobs,
     decisions: Decisions,
     messages: Messages,
-    signals: mpsc::UnboundedSender<Signal>,
+    finished: mpsc::UnboundedSender<FinishedDecision>,
 ) {
     loop {
-        let incoming = match queue.recv().await {
-            Ok(incoming) => incoming,
-            Err(err) => {
-                tracing::error!(error = %err, "score worker stopped");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
+        let Some(delivery) = jobs.recv().await else {
+            return;
         };
-        if let Err(err) = run(&incoming.job, &decisions, &messages, &signals).await {
-            log_background(&err);
-            let _ = incoming.nack().await;
-            if signals.is_closed() {
-                return;
+        let decision_id = delivery.job.decision_id;
+        match run(&delivery.job, &decisions, &messages, &finished).await {
+            Ok(()) => {
+                if let Err(err) = delivery.ack().await {
+                    tracing::error!(error = %err, decision_id, "score job could not be acknowledged");
+                }
             }
-            continue;
-        }
-        if let Err(err) = incoming.ack().await {
-            tracing::error!(error = %err, "score job could not be acknowledged");
+            Err(err) => {
+                tracing::error!(error = %err, decision_id, "score job failed");
+                tokio::time::sleep(REQUEUE_PAUSE).await;
+                if let Err(err) = delivery.requeue().await {
+                    tracing::error!(error = %err, "score job could not be requeued");
+                }
+            }
         }
     }
 }
@@ -41,18 +39,18 @@ async fn run(
     job: &ScoreJob,
     decisions: &Decisions,
     messages: &Messages,
-    signals: &mpsc::UnboundedSender<Signal>,
+    finished: &mpsc::UnboundedSender<FinishedDecision>,
 ) -> Result<(), AppError> {
     let Some(decision) = decisions.get(job.decision_id).await? else {
-        signal(signals, job.decision_id, false)?;
+        notify(finished, job.decision_id, false);
         return Ok(());
     };
     if decision.status != Status::Pending {
-        signal(signals, decision.id, false)?;
+        notify(finished, decision.id, false);
         return Ok(());
     }
-    let fresh = score_message(decisions, messages, &decision.tenant, &decision).await?;
-    signal(signals, decision.id, fresh)?;
+    let completed_now = score_message(decisions, messages, &decision).await?;
+    notify(finished, decision.id, completed_now);
     Ok(())
 }
 
@@ -84,14 +82,23 @@ async fn score_message(
     }
 }
 
-fn signal(
-    signals: &mpsc::UnboundedSender<Signal>,
+fn notify(
+    finished: &mpsc::UnboundedSender<FinishedDecision>,
     decision_id: i64,
-    fresh: bool,
-) -> Result<(), AppError> {
-    signals
-        .send(Signal { decision_id, fresh })
-        .map_err(|_| queue("signaling a decision", "the observer stopped"))
+    completed_now: bool,
+) {
+    if finished
+        .send(FinishedDecision {
+            decision_id,
+            completed_now,
+        })
+        .is_err()
+    {
+        tracing::error!(
+            decision_id,
+            "the observer stopped before a decision was delivered"
+        );
+    }
 }
 
 pub(super) fn lines(messages: &[&Message], judged_row_id: i64) -> String {

@@ -23,7 +23,7 @@ impl App {
         let provider = Provider::from_config(config.provider)?;
         let queue = Queue::connect(&config.rabbitmq_url).await?;
         let engine = Engine::new(pool, provider, config.window, config.threshold, queue)?;
-        engine.serve(config.workers).await?;
+        engine.serve(config.workers);
         Ok(Self {
             engine,
             api_key: config.api_key,
