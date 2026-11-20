@@ -20,6 +20,7 @@ pub(crate) enum AppError {
     ScoreTimeout,
     Database { action: &'static str },
     Queue { action: &'static str },
+    Cache { action: &'static str },
     Provider(Fault),
 }
 
@@ -31,6 +32,11 @@ pub(crate) fn database(action: &'static str, err: impl Display) -> AppError {
 pub(crate) fn queue(action: &'static str, err: impl Display) -> AppError {
     tracing::error!(error = %err, "queue failed while {action}");
     AppError::Queue { action }
+}
+
+pub(crate) fn cache(action: &'static str, err: impl Display) -> AppError {
+    tracing::error!(error = %err, "cache failed while {action}");
+    AppError::Cache { action }
 }
 
 impl Display for AppError {
@@ -57,9 +63,10 @@ fn status(err: &AppError) -> StatusCode {
         | AppError::WebhookUrlInvalid
         | AppError::InvalidLimit => StatusCode::BAD_REQUEST,
         AppError::ScoreTimeout => StatusCode::GATEWAY_TIMEOUT,
-        AppError::WebhookEncode | AppError::Database { .. } | AppError::Queue { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        AppError::WebhookEncode
+        | AppError::Database { .. }
+        | AppError::Queue { .. }
+        | AppError::Cache { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         AppError::Provider(_) => StatusCode::BAD_GATEWAY,
     }
 }
@@ -85,6 +92,7 @@ fn client_message(err: &AppError) -> String {
         AppError::ScoreTimeout => "Scoring did not finish in time.".to_owned(),
         AppError::Database { action } => format!("The database failed while {action}."),
         AppError::Queue { action } => format!("The queue failed while {action}."),
+        AppError::Cache { action } => format!("The cache failed while {action}."),
         AppError::Provider(fault) => {
             format!(
                 "Could not decide on the message. {}",
