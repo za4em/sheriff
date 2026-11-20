@@ -100,9 +100,20 @@ impl Engine {
             }
             if finished.completed_now
                 && let Some(decision) = decision
+                && self.claim_webhook(finished.decision_id).await
                 && let Err(err) = self.webhook(&decision).await
             {
                 tracing::error!(error = %err, "background work failed");
+            }
+        }
+    }
+
+    async fn claim_webhook(&self, decision_id: i64) -> bool {
+        match self.cache.claim_webhook(decision_id).await {
+            Ok(claimed) => claimed,
+            Err(err) => {
+                tracing::error!(error = %err, "background work failed");
+                false
             }
         }
     }
