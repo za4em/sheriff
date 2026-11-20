@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use super::category::{self, Action, Category};
-use super::messages::IncomingMessage;
 use super::provider::{DecisionProvider, Fault, Probabilities, Provider, Question, Questions};
 use crate::error::AppError;
 
@@ -23,11 +22,37 @@ pub(crate) enum Status {
 
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub(crate) struct Decision {
-    pub(crate) message_id: String,
+    #[serde(skip_serializing)]
+    pub(crate) id: i64,
+    #[serde(skip_serializing)]
+    #[sqlx(rename = "tenant_id")]
+    pub(crate) tenant: String,
+    #[serde(skip_serializing)]
+    #[sqlx(rename = "message_id")]
+    pub(crate) message_row_id: i64,
+    #[serde(rename = "message_id")]
+    pub(crate) client_message_id: String,
     pub(crate) status: Status,
     pub(crate) action: Option<Action>,
     #[sqlx(json(nullable))]
     pub(crate) categories: Option<CategoryScores>,
+    pub(crate) error: Option<String>,
+    #[serde(skip_serializing)]
+    pub(crate) context: Vec<i64>,
+}
+
+pub(crate) struct MessageWithContext {
+    pub(crate) message_row_id: i64,
+    pub(crate) context: Vec<i64>,
+}
+
+/// Inserts on the caller's transaction. The engine owns that transaction.
+pub(crate) async fn insert_pending_on(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    messages: &[MessageWithContext],
+) -> Result<Vec<i64>, AppError> {
+    repository::insert_pending(connection, tenant, messages).await
 }
 
 #[derive(Clone)]
@@ -46,19 +71,15 @@ impl Decisions {
         }
     }
 
-    pub(crate) async fn open(
+    pub(crate) async fn stale_pending(
         &self,
-        tenant: &str,
-        messages: &[IncomingMessage],
+        seconds: i64,
+        limit: i64,
     ) -> Result<Vec<i64>, AppError> {
-        repository::open(&self.pool, tenant, messages).await
+        repository::stale_pending(&self.pool, seconds, limit).await
     }
 
-    pub(crate) async fn score(
-        &self,
-        message: &IncomingMessage,
-        state: &str,
-    ) -> Result<Decision, AppError> {
+    pub(crate) async fn score(&self, state: &str) -> Result<(Action, CategoryScores), AppError> {
         let questions = message_questions();
         let probabilities = self
             .provider
@@ -67,28 +88,36 @@ impl Decisions {
             .map_err(AppError::Provider)?;
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
         let chosen = category::action(&hits(&categories, self.threshold));
-        Ok(Decision {
-            message_id: message.message_id.clone(),
-            status: Status::Ready,
-            action: Some(chosen),
-            categories: Some(categories),
-        })
+        Ok((chosen, categories))
     }
 
-    pub(crate) async fn write_ready(
+    pub(crate) async fn mark_ready(
         &self,
         decision_id: i64,
-        decision: &Decision,
-    ) -> Result<(), AppError> {
-        let (Some(action), Some(categories)) = (decision.action, decision.categories.as_ref())
-        else {
-            return Ok(());
-        };
-        repository::write_ready(&self.pool, decision_id, action, categories).await
+        action: Action,
+        categories: &CategoryScores,
+    ) -> Result<bool, AppError> {
+        repository::mark_ready(&self.pool, decision_id, action, categories).await
     }
 
-    pub(crate) async fn mark_failed(&self, decision_id: i64) -> Result<(), AppError> {
-        repository::mark_failed(&self.pool, decision_id).await
+    pub(crate) async fn mark_failed(
+        &self,
+        decision_id: i64,
+        error: &str,
+    ) -> Result<bool, AppError> {
+        repository::mark_failed(&self.pool, decision_id, error).await
+    }
+
+    pub(crate) async fn get(&self, id: i64) -> Result<Option<Decision>, AppError> {
+        Ok(self.get_many(&[id]).await?.into_iter().next())
+    }
+
+    pub(crate) async fn get_many(&self, ids: &[i64]) -> Result<Vec<Decision>, AppError> {
+        repository::get(&self.pool, ids).await
+    }
+
+    pub(crate) async fn delete(&self, ids: &[i64]) -> Result<(), AppError> {
+        repository::delete(&self.pool, ids).await
     }
 
     pub(crate) async fn list(

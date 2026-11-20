@@ -4,7 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 
 use crate::{
     config::Config,
-    core::{Engine, provider::Provider},
+    core::{Engine, provider::Provider, queue::Queue},
 };
 
 #[derive(Clone)]
@@ -21,8 +21,11 @@ impl App {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let provider = Provider::from_config(config.provider)?;
+        let queue = Queue::connect(&config.rabbitmq_url).await?;
+        let engine = Engine::new(pool, provider, config.window, config.threshold, queue)?;
+        engine.serve(config.workers);
         Ok(Self {
-            engine: Engine::new(pool, provider, config.window, config.threshold)?,
+            engine,
             api_key: config.api_key,
         })
     }

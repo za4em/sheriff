@@ -13,11 +13,7 @@ use tokio::sync::mpsc;
 use super::tenant::Tenant;
 use crate::{
     app::App,
-    core::{
-        Engine,
-        engine::{Score, ScoreReply},
-        messages::IncomingMessage,
-    },
+    core::{Engine, decisions::Decision, engine::SocketSender, messages::IncomingMessage},
     error::AppError,
 };
 
@@ -36,7 +32,7 @@ async fn stream(
 }
 
 async fn session(mut socket: WebSocket, engine: Engine, tenant_id: String) {
-    let (reply, mut scores) = mpsc::unbounded_channel::<Score>();
+    let (reply, mut decisions) = mpsc::unbounded_channel::<Decision>();
     loop {
         tokio::select! {
             frame = socket.recv() => {
@@ -54,11 +50,11 @@ async fn session(mut socket: WebSocket, engine: Engine, tenant_id: String) {
                     break;
                 }
             }
-            score = scores.recv() => {
-                let Some(score) = score else {
+            decision = decisions.recv() => {
+                let Some(decision) = decision else {
                     break;
                 };
-                if !send_json(&mut socket, &score).await {
+                if !send_json(&mut socket, &decision).await {
                     break;
                 }
             }
@@ -70,7 +66,7 @@ async fn handle_frame(
     socket: &mut WebSocket,
     engine: &Engine,
     tenant_id: &str,
-    reply: &ScoreReply,
+    reply: &SocketSender,
     frame: Message,
 ) -> bool {
     match frame {
