@@ -19,3 +19,4 @@ sha2 = "0.10.9"
 lapin = { version = "4.12.3", default-features = false, features = ["tokio"] }
 futures-lite = "2.6.1"
 redis = { version = "1.8.2", features = ["tokio-comp", "connection-manager"] }
+prometheus = { version = "0.14.0", default-features = false }
