@@ -42,6 +42,14 @@ A message that could not be scored uses the same fields. `status` is `failed`, `
 
 `GET /v1/stream` is the same save, over a websocket. Send the JSON array as a text frame. Each decision arrives later as its own text frame. A problem before the job starts arrives immediately as `{"error":"..."}`.
 
-## RabbitMQ and Redis
+## Cache
 
-RabbitMQ lets several instances share the scoring work. Redis wakes the instance still holding the HTTP call or websocket when another instance finishes the job.
+Redis is the cache, on port 6379. A finished decision is written to a stream every instance reads, so the instance still holding the HTTP call or websocket can deliver it. Redis also claims the webhook, so only one instance posts it.
+
+## Queue
+
+RabbitMQ is the queue, on port 5672. A score job goes there so any instance can take it, and a failed attempt goes back on the queue.
+
+## Observability
+
+Prometheus, on port 9090, scrapes what the process records: decisions, latency, queue depth, retries, webhook failures, and open websockets. Grafana, on port 3001, shows that scrape.
