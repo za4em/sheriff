@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use super::Signal;
 use super::log_background;
 use crate::core::decisions::{Decision, Decisions, Status};
-use crate::core::messages::{IncomingMessage, Messages};
+use crate::core::messages::{Message, Messages};
 use crate::core::provider::JUDGED;
 use crate::core::queue::{Queue, ScoreJob};
 use crate::error::{AppError, queue};
@@ -59,10 +59,11 @@ async fn run(
 async fn score_message(
     decisions: &Decisions,
     messages: &Messages,
-    tenant: &str,
     decision: &Decision,
 ) -> Result<bool, AppError> {
-    let prompt = messages.get_many(tenant, &decision.context).await?;
+    let prompt = messages
+        .get_many(&decision.tenant, &decision.context)
+        .await?;
     if prompt.len() != decision.context.len() {
         return decisions
             .mark_failed(decision.id, "The message could not be read.")
@@ -70,16 +71,14 @@ async fn score_message(
     }
     let Some(judged) = prompt
         .iter()
-        .find(|message| message.id == decision.message_id)
+        .find(|message| message.row_id == decision.message_row_id)
     else {
         return decisions
             .mark_failed(decision.id, "The message could not be read.")
             .await;
     };
-    match decisions
-        .score(&lines(&prompt.iter().collect::<Vec<_>>(), judged.id))
-        .await
-    {
+    let lines = lines(&prompt.iter().collect::<Vec<_>>(), judged.row_id);
+    match decisions.score(&lines).await {
         Ok((action, categories)) => decisions.mark_ready(decision.id, action, &categories).await,
         Err(err) => decisions.mark_failed(decision.id, &err.to_string()).await,
     }
@@ -95,11 +94,15 @@ fn signal(
         .map_err(|_| queue("signaling a decision", "the observer stopped"))
 }
 
-pub(super) fn lines(messages: &[&IncomingMessage], judged: i64) -> String {
+pub(super) fn lines(messages: &[&Message], judged_row_id: i64) -> String {
     messages
         .iter()
         .map(|message| {
-            let mark = if message.id == judged { JUDGED } else { "" };
+            let mark = if message.row_id == judged_row_id {
+                JUDGED
+            } else {
+                ""
+            };
             format!("{mark}{}: {}", message.user_id, message.text)
         })
         .collect::<Vec<_>>()

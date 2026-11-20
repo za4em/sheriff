@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 
 use super::decisions::{Decision, Decisions, MessageWithContext, Status};
-use super::messages::{IncomingMessage, Messages};
+use super::messages::{IncomingMessage, Message, Messages};
 use super::provider::Provider;
 use super::queue::{Queue, ScoreJob};
 use super::webhooks::Webhooks;
@@ -15,7 +15,7 @@ mod worker;
 
 use wait::{Notice, WaitList};
 
-type RoomWindows = BTreeMap<String, Vec<IncomingMessage>>;
+type RoomWindows = BTreeMap<String, Vec<Message>>;
 
 pub(crate) type SocketSender = mpsc::UnboundedSender<Decision>;
 
@@ -184,10 +184,11 @@ impl Engine {
             .map_err(|err| database("saving a batch", err))?;
         let mut stored = Vec::with_capacity(messages.len());
         for message in messages {
-            stored.push(Messages::insert(&mut tx, tenant, message, retained).await?);
+            stored.push(super::messages::insert_on(&mut tx, tenant, message, retained).await?);
         }
         let ids =
-            Decisions::insert_pending(&mut tx, tenant, &with_context(&windows, &stored)).await?;
+            super::decisions::insert_pending_on(&mut tx, tenant, &with_context(&windows, &stored))
+                .await?;
         tx.commit()
             .await
             .map_err(|err| database("saving a batch", err))?;
@@ -253,12 +254,12 @@ async fn windows(
     Ok(windows)
 }
 
-fn with_context(windows: &RoomWindows, messages: &[IncomingMessage]) -> Vec<MessageWithContext> {
+fn with_context(windows: &RoomWindows, messages: &[Message]) -> Vec<MessageWithContext> {
     messages
         .iter()
         .enumerate()
         .map(|(index, message)| MessageWithContext {
-            message_id: message.id,
+            message_row_id: message.row_id,
             context: context(
                 windows
                     .get(&message.room_id)
@@ -268,19 +269,15 @@ fn with_context(windows: &RoomWindows, messages: &[IncomingMessage]) -> Vec<Mess
                 index,
             )
             .into_iter()
-            .map(|line| line.id)
+            .map(|line| line.row_id)
             .collect(),
         })
         .collect()
 }
 
-fn context<'a>(
-    prior: &'a [IncomingMessage],
-    batch: &'a [IncomingMessage],
-    index: usize,
-) -> Vec<&'a IncomingMessage> {
+fn context<'a>(prior: &'a [Message], batch: &'a [Message], index: usize) -> Vec<&'a Message> {
     let room = &batch[index].room_id;
-    let mut window: Vec<&IncomingMessage> = prior.iter().collect();
+    let mut window: Vec<&Message> = prior.iter().collect();
     window.extend(
         batch[..=index]
             .iter()
@@ -321,7 +318,6 @@ mod tests {
 
     fn incoming(message_id: &str, room_id: &str, user_id: &str, text: &str) -> IncomingMessage {
         IncomingMessage {
-            id: 0,
             client_message_id: message_id.to_owned(),
             room_id: room_id.to_owned(),
             user_id: user_id.to_owned(),
@@ -332,22 +328,12 @@ mod tests {
         }
     }
 
-    fn stored(
-        id: i64,
-        message_id: &str,
-        room_id: &str,
-        user_id: &str,
-        text: &str,
-    ) -> IncomingMessage {
-        IncomingMessage {
-            id,
-            client_message_id: message_id.to_owned(),
+    fn message(row_id: i64, room_id: &str, user_id: &str, text: &str) -> Message {
+        Message {
+            row_id,
             room_id: room_id.to_owned(),
             user_id: user_id.to_owned(),
             text: text.to_owned(),
-            timestamp: 1,
-            reply_to: None,
-            meta: json!({}),
         }
     }
 
@@ -369,10 +355,10 @@ mod tests {
 
     #[test]
     fn state_marks_only_the_message_being_judged() {
-        let messages = vec![
-            stored(1, "m1", "r", "u1", "you're an idiot"),
-            stored(2, "m2", "r", "u2", "hello"),
-            stored(3, "m3", "r", "u3", "ok"),
+        let messages = [
+            message(1, "r", "u1", "you're an idiot"),
+            message(2, "r", "u2", "hello"),
+            message(3, "r", "u3", "ok"),
         ];
         assert_eq!(
             worker::lines(&messages.iter().collect::<Vec<_>>(), 2),
@@ -382,12 +368,12 @@ mod tests {
 
     #[test]
     fn the_batch_is_applied_onto_the_room_in_order() {
-        let prior = vec![at(stored(10, "m0", "r", "u0", "earlier"), 1)];
+        let prior = vec![message(10, "r", "u0", "earlier")];
         let batch = vec![
-            at(stored(1, "m1", "r", "u1", "you're an idiot"), 3),
-            at(stored(2, "m2", "r", "u2", "hello"), 4),
-            at(stored(3, "m3", "other", "u1", "ok"), 5),
-            at(stored(4, "m4", "r", "u1", "idiot"), 6),
+            message(1, "r", "u1", "you're an idiot"),
+            message(2, "r", "u2", "hello"),
+            message(3, "other", "u1", "ok"),
+            message(4, "r", "u1", "idiot"),
         ];
         assert_eq!(
             worker::lines(&context(&prior, &batch, 0), 1),
@@ -399,17 +385,17 @@ mod tests {
         );
         assert_eq!(worker::lines(&context(&[], &batch, 2), 3), "[this] u1: ok");
         let fourth = context(&prior, &batch, 3);
-        assert!(fourth.iter().any(|message| message.id == 1));
-        assert!(fourth.iter().any(|message| message.id == 2));
+        assert!(fourth.iter().any(|message| message.row_id == 1));
+        assert!(fourth.iter().any(|message| message.row_id == 2));
         assert!(fourth.iter().all(|message| message.room_id == "r"));
     }
 
     #[test]
     fn a_repeated_client_id_is_another_message() {
-        let prior = vec![at(stored(1, "m1", "r", "u1", "old"), 1)];
+        let prior = vec![message(1, "r", "u1", "old")];
         let batch = vec![
-            at(stored(2, "m1", "r", "u1", "first"), 2),
-            at(stored(3, "m1", "r", "u1", "second"), 3),
+            message(2, "r", "u1", "first"),
+            message(3, "r", "u1", "second"),
         ];
         let window = context(&prior, &batch, 1);
         assert_eq!(
@@ -423,19 +409,14 @@ mod tests {
 
     #[test]
     fn the_batch_is_appended_in_request_order() {
-        let prior = vec![at(stored(10, "m0", "r", "u0", "stored"), 5)];
+        let prior = vec![message(10, "r", "u0", "stored")];
         let batch = vec![
-            at(stored(1, "m1", "r", "u1", "first"), 1),
-            at(stored(2, "m2", "r", "u2", "second"), 9),
+            message(1, "r", "u1", "first"),
+            message(2, "r", "u2", "second"),
         ];
         assert_eq!(
             worker::lines(&context(&prior, &batch, 1), 2),
             "u0: stored\nu1: first\n[this] u2: second"
         );
-    }
-
-    fn at(mut message: IncomingMessage, timestamp: i64) -> IncomingMessage {
-        message.timestamp = timestamp;
-        message
     }
 }
