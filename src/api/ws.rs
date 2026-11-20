@@ -15,6 +15,7 @@ use crate::{
     app::App,
     core::{Engine, decisions::Decision, engine::SocketSender, messages::IncomingMessage},
     error::AppError,
+    metrics::Metrics,
 };
 
 pub(crate) fn routes() -> Router<App> {
@@ -28,10 +29,12 @@ async fn stream(
 ) -> impl IntoResponse {
     tracing::info!(tenant = %id, "websocket connected");
     let engine = app.engine.clone();
-    ws.on_upgrade(move |socket| session(socket, engine, id))
+    let metrics = app.metrics.clone();
+    ws.on_upgrade(move |socket| session(socket, engine, metrics, id))
 }
 
-async fn session(mut socket: WebSocket, engine: Engine, tenant_id: String) {
+async fn session(mut socket: WebSocket, engine: Engine, metrics: Metrics, tenant_id: String) {
+    let _connection = OpenConnection::open(metrics);
     let (reply, mut decisions) = mpsc::unbounded_channel::<Decision>();
     loop {
         tokio::select! {
@@ -83,6 +86,21 @@ async fn handle_frame(
         Message::Binary(_) => send_error(socket, &AppError::InvalidMessage).await,
         Message::Close(_) => false,
         Message::Ping(_) | Message::Pong(_) => true,
+    }
+}
+
+struct OpenConnection(Metrics);
+
+impl OpenConnection {
+    fn open(metrics: Metrics) -> Self {
+        metrics.open_websocket();
+        Self(metrics)
+    }
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.close_websocket();
     }
 }
 
