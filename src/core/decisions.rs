@@ -28,7 +28,8 @@ pub(crate) struct Decision {
     #[sqlx(rename = "tenant_id")]
     pub(crate) tenant: String,
     #[serde(skip_serializing)]
-    pub(crate) message_id: i64,
+    #[sqlx(rename = "message_id")]
+    pub(crate) message_row_id: i64,
     #[serde(rename = "message_id")]
     pub(crate) client_message_id: String,
     pub(crate) status: Status,
@@ -41,8 +42,17 @@ pub(crate) struct Decision {
 }
 
 pub(crate) struct MessageWithContext {
-    pub(crate) message_id: i64,
+    pub(crate) message_row_id: i64,
     pub(crate) context: Vec<i64>,
+}
+
+/// Inserts on the caller's transaction. The engine owns that transaction.
+pub(crate) async fn insert_pending_on(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    messages: &[MessageWithContext],
+) -> Result<Vec<i64>, AppError> {
+    repository::insert_pending(connection, tenant, messages).await
 }
 
 #[derive(Clone)]
@@ -59,14 +69,6 @@ impl Decisions {
             provider,
             threshold,
         }
-    }
-
-    pub(crate) async fn insert_pending(
-        connection: &mut sqlx::PgConnection,
-        tenant: &str,
-        messages: &[MessageWithContext],
-    ) -> Result<Vec<i64>, AppError> {
-        repository::insert_pending(connection, tenant, messages).await
     }
 
     pub(crate) async fn score(&self, state: &str) -> Result<(Action, CategoryScores), AppError> {

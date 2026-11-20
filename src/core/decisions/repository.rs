@@ -19,7 +19,7 @@ pub(super) async fn insert_pending(
             "#,
         )
         .bind(tenant)
-        .bind(message.message_id)
+        .bind(message.message_row_id)
         .bind(Status::Pending)
         .bind(&message.context)
         .fetch_one(&mut *connection)
