@@ -6,8 +6,11 @@
 //! give each id to only one instance.
 
 use redis::aio::ConnectionManager;
+use tokio::sync::mpsc;
 
 use crate::error::{AppError, cache as failed};
+
+mod reader;
 
 const READY: &str = "sheriff.ready";
 
@@ -70,5 +73,41 @@ impl Cache {
         .await
         .map_err(|err| failed("recording a ready decision", err))?;
         Ok(())
+    }
+
+    /// Resolves after the read cursor is set, so a job cannot finish unseen.
+    pub(crate) async fn listen_decisions(&self) -> mpsc::UnboundedReceiver<ReadyDecision> {
+        reader::listen_decisions(self.client.clone()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs a disposable cache at CACHE_URL"]
+    async fn a_ready_decision_reaches_a_subscriber() {
+        let url = std::env::var("CACHE_URL").unwrap();
+        assert!(
+            url.contains("localhost") || url.contains("127.0.0.1"),
+            "refusing to write on a non-local cache"
+        );
+        let cache = Cache::connect(&url, 100_000).await.unwrap();
+        let mut incoming = cache.listen_decisions().await;
+        let decision_id = uuid::Uuid::new_v4().as_u128() as i64;
+        cache.ready_decision(decision_id, true).await.unwrap();
+        let found = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(ready) = incoming.recv().await {
+                if ready.decision_id == decision_id && ready.completed_now {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(found, Ok(true));
     }
 }
