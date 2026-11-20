@@ -94,35 +94,6 @@ pub(super) async fn mark_failed(
     Ok(saved.rows_affected() > 0)
 }
 
-pub(super) async fn mark_failed_ids(
-    pool: &PgPool,
-    ids: &[i64],
-    error: &str,
-) -> Result<(), AppError> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    sqlx::query(
-        r#"
-        UPDATE decisions
-        SET status = $2,
-            action = NULL,
-            error = $3,
-            updated_at = now()
-        WHERE id = ANY($1)
-          AND status = $4
-        "#,
-    )
-    .bind(ids)
-    .bind(Status::Failed)
-    .bind(error)
-    .bind(Status::Pending)
-    .execute(pool)
-    .await
-    .map_err(|err| database("marking decisions failed", err))?;
-    Ok(())
-}
-
 pub(super) async fn list(
     pool: &PgPool,
     tenant: &str,
@@ -218,6 +189,29 @@ pub(super) async fn get(pool: &PgPool, ids: &[i64]) -> Result<Vec<Decision>, App
     .fetch_all(pool)
     .await
     .map_err(|err| database("reading decisions", err))
+}
+
+pub(super) async fn stale_pending(
+    pool: &PgPool,
+    seconds: i64,
+    limit: i64,
+) -> Result<Vec<i64>, AppError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM decisions
+        WHERE status = $1
+          AND updated_at < now() - make_interval(secs => $2)
+        ORDER BY updated_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(Status::Pending)
+    .bind(seconds as f64)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| database("finding stale decisions", err))
 }
 
 pub(super) async fn delete(pool: &PgPool, ids: &[i64]) -> Result<(), AppError> {

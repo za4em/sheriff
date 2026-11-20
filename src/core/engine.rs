@@ -4,13 +4,14 @@ use std::time::Duration;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 
-use super::decisions::{Decision, Decisions, MessageWithContext, Status};
+use super::decisions::{Decision, Decisions, MessageWithContext};
 use super::messages::{IncomingMessage, Message, Messages};
 use super::provider::Provider;
 use super::queue::{Queue, ScoreJob};
 use super::webhooks::Webhooks;
 use crate::error::{AppError, database, queue};
 
+mod sweep;
 mod wait;
 mod worker;
 
@@ -56,11 +57,15 @@ impl Engine {
     }
 
     /// Workers score jobs. The observer delivers sockets and webhooks.
+    /// The sweeper republishes pending decisions left behind by a crash.
     pub(crate) fn serve(&self, workers: usize) {
         let jobs = self.queue.clone().listen(workers);
         let (finished_tx, finished_rx) = mpsc::unbounded_channel();
         let observer = self.clone();
         tokio::spawn(async move { observer.observe(finished_rx).await });
+        let sweep_decisions = self.decisions.clone();
+        let sweep_queue = self.queue.clone();
+        tokio::spawn(async move { sweep::run(sweep_decisions, sweep_queue).await });
         for _ in 0..workers {
             let jobs = jobs.clone();
             let decisions = self.decisions.clone();
@@ -190,39 +195,16 @@ impl Engine {
         Ok(ids)
     }
 
-    /// Publishes one job per decision. Decisions that never reach the queue are marked failed.
-    /// Returns how many jobs were published.
+    /// Publishes one job per decision. A job that does not reach the broker stays pending
+    /// for the sweeper. Returns how many leading jobs were published.
     async fn enqueue(&self, ids: &[i64]) -> usize {
         for (published, id) in ids.iter().copied().enumerate() {
             if let Err(err) = self.queue.publish(&ScoreJob { decision_id: id }).await {
-                let reason = err.to_string();
-                let unpublished = &ids[published..];
-                if let Err(mark) = self.decisions.mark_failed_ids(unpublished, &reason).await {
-                    log_background(&mark);
-                }
-                self.send_failed(unpublished).await;
+                tracing::error!(error = %err, decision_id = id, "score job was not published");
                 return published;
             }
         }
         ids.len()
-    }
-
-    async fn send_failed(&self, ids: &[i64]) {
-        let Some(socket) = self.waiting.take_many(ids) else {
-            return;
-        };
-        let rows = match self.decisions.get_many(ids).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                log_background(&err);
-                return;
-            }
-        };
-        for decision in rows {
-            if decision.status != Status::Pending {
-                let _ = socket.send(decision);
-            }
-        }
     }
 
     fn watch(&self, ids: &[i64]) -> Vec<ScoreWait> {
@@ -315,10 +297,6 @@ fn validate(message: &IncomingMessage) -> Result<(), AppError> {
         }
     }
     Ok(())
-}
-
-fn log_background(err: &AppError) {
-    tracing::error!(error = %err, "background work failed");
 }
 
 #[cfg(test)]

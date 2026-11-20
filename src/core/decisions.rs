@@ -71,6 +71,14 @@ impl Decisions {
         }
     }
 
+    pub(crate) async fn stale_pending(
+        &self,
+        seconds: i64,
+        limit: i64,
+    ) -> Result<Vec<i64>, AppError> {
+        repository::stale_pending(&self.pool, seconds, limit).await
+    }
+
     pub(crate) async fn score(&self, state: &str) -> Result<(Action, CategoryScores), AppError> {
         let questions = message_questions();
         let probabilities = self
@@ -98,10 +106,6 @@ impl Decisions {
         error: &str,
     ) -> Result<bool, AppError> {
         repository::mark_failed(&self.pool, decision_id, error).await
-    }
-
-    pub(crate) async fn mark_failed_ids(&self, ids: &[i64], error: &str) -> Result<(), AppError> {
-        repository::mark_failed_ids(&self.pool, ids, error).await
     }
 
     pub(crate) async fn get(&self, id: i64) -> Result<Option<Decision>, AppError> {
