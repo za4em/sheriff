@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -21,6 +22,8 @@ struct FinishedDecision {
     decision_id: i64,
     completed_now: bool,
 }
+
+const SCORE_WAIT: Duration = Duration::from_secs(5);
 
 type RoomWindows = BTreeMap<String, Vec<Message>>;
 
@@ -109,7 +112,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Stores the batch as not retained, waits until the worker finishes, reads the rows, then deletes them.
+    /// Stores the batch as not retained, waits until the workers finish, then deletes the rows.
     pub(crate) async fn score(
         &self,
         tenant: &str,
@@ -119,18 +122,22 @@ impl Engine {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let receivers = self.watch(&ids);
+        let mut waits = self.watch(&ids);
         let published = self.enqueue(&ids).await;
-        for receiver in receivers.into_iter().take(published) {
-            receiver
-                .await
-                .map_err(|err| queue("waiting for a score", err))?;
-        }
+        waits.truncate(published);
+        self.wait_for(waits).await?;
         let decisions = self.decisions.get_many(&ids).await;
         if let Err(err) = self.decisions.delete(&ids).await {
-            log_background(&err);
+            tracing::error!(error = %err, "background work failed");
         }
-        Ok(decisions?)
+        let decisions = decisions?;
+        if published != ids.len() {
+            return Err(queue(
+                "publishing a score job",
+                "the broker did not accept the job",
+            ));
+        }
+        Ok(decisions)
     }
 
     /// Stores the batch as retained and publishes one job per decision. Returns before the worker finishes.
@@ -218,11 +225,26 @@ impl Engine {
         }
     }
 
-    fn watch(&self, ids: &[i64]) -> Vec<tokio::sync::oneshot::Receiver<()>> {
+    fn watch(&self, ids: &[i64]) -> Vec<ScoreWait> {
         ids.iter()
             .copied()
-            .map(|id| self.waiting.call(id))
+            .map(|id| self.waiting.reply(id))
             .collect()
+    }
+
+    async fn wait_for(&self, waits: Vec<ScoreWait>) -> Result<(), AppError> {
+        let finished = async {
+            for wait in waits {
+                wait.finished()
+                    .await
+                    .map_err(|err| queue("waiting for a score", err))?;
+            }
+            Ok(())
+        };
+        match tokio::time::timeout(SCORE_WAIT, finished).await {
+            Ok(result) => result,
+            Err(_) => Err(AppError::ScoreTimeout),
+        }
     }
 }
 
