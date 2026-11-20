@@ -8,6 +8,9 @@ use sqlx::PgPool;
 use super::category::{self, Action, Category};
 use super::provider::{DecisionProvider, Fault, Probabilities, Provider, Question, Questions};
 use crate::error::AppError;
+use crate::metrics::Metrics;
+
+const FAILED: &str = "failed";
 
 pub(crate) type CategoryScores = BTreeMap<Category, f64>;
 
@@ -60,14 +63,20 @@ pub(crate) struct Decisions {
     pool: PgPool,
     provider: Provider,
     threshold: f64,
+    metrics: Metrics,
 }
 
 impl Decisions {
-    pub(crate) fn new(pool: PgPool, provider: Provider, threshold: f64) -> Self {
+    pub(crate) fn new(pool: PgPool, provider: Provider, threshold: f64, metrics: Metrics) -> Self {
+        for action in [Action::Allow, Action::Hide, Action::Mute, Action::Escalate] {
+            metrics.prepare_decision(action.name());
+        }
+        metrics.prepare_decision(FAILED);
         Self {
             pool,
             provider,
             threshold,
+            metrics,
         }
     }
 
@@ -97,7 +106,11 @@ impl Decisions {
         action: Action,
         categories: &CategoryScores,
     ) -> Result<bool, AppError> {
-        repository::mark_ready(&self.pool, decision_id, action, categories).await
+        let saved = repository::mark_ready(&self.pool, decision_id, action, categories).await?;
+        if saved {
+            self.metrics.decision(action.name());
+        }
+        Ok(saved)
     }
 
     pub(crate) async fn mark_failed(
@@ -105,7 +118,11 @@ impl Decisions {
         decision_id: i64,
         error: &str,
     ) -> Result<bool, AppError> {
-        repository::mark_failed(&self.pool, decision_id, error).await
+        let saved = repository::mark_failed(&self.pool, decision_id, error).await?;
+        if saved {
+            self.metrics.decision(FAILED);
+        }
+        Ok(saved)
     }
 
     pub(crate) async fn get(&self, id: i64) -> Result<Option<Decision>, AppError> {

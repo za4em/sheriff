@@ -11,6 +11,7 @@ use super::provider::Provider;
 use super::queue::{Queue, ScoreJob};
 use super::webhooks::Webhooks;
 use crate::error::{AppError, database, queue};
+use crate::metrics::Metrics;
 
 mod sweep;
 mod wait;
@@ -33,6 +34,7 @@ pub(crate) struct Engine {
     queue: Queue,
     cache: Cache,
     waiting: WaitList,
+    metrics: Metrics,
 }
 
 impl Engine {
@@ -43,15 +45,17 @@ impl Engine {
         threshold: f64,
         queue: Queue,
         cache: Cache,
+        metrics: Metrics,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             pool: pool.clone(),
             messages: Messages::new(pool.clone(), window),
-            decisions: Decisions::new(pool.clone(), provider, threshold),
+            decisions: Decisions::new(pool.clone(), provider, threshold, metrics.clone()),
             webhooks: Webhooks::new(pool)?,
             queue,
             cache,
             waiting: WaitList::default(),
+            metrics,
         })
     }
 
