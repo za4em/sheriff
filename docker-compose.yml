@@ -15,7 +15,7 @@ services:
       timeout: 5s
       retries: 20
 
-  rabbitmq:
+  queue:
     image: rabbitmq:4-management-alpine
     ports:
       - "5672:5672"
@@ -24,7 +24,7 @@ services:
       RABBITMQ_DEFAULT_USER: sheriff
       RABBITMQ_DEFAULT_PASS: sheriff
     volumes:
-      - rabbitmq:/var/lib/rabbitmq
+      - queue:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -33,4 +33,4 @@ services:
 
 volumes:
   postgres:
-  rabbitmq:
+  queue:

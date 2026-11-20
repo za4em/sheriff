@@ -129,7 +129,7 @@ impl Queue {
                 }
             }
             Err(err) => {
-                tracing::error!(error = %err, "rabbitmq reconnect failed");
+                tracing::error!(error = %err, "queue reconnect failed");
                 *guard = None;
             }
         }
@@ -168,7 +168,7 @@ impl Queue {
             .confirm_select(ConfirmSelectOptions::default())
             .await?;
         declare_score_queue(&publisher).await?;
-        tracing::info!("connected to rabbitmq");
+        tracing::info!("connected to the queue");
         Ok(Session {
             connection,
             publisher,
@@ -267,12 +267,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs a disposable RabbitMQ at RABBITMQ_URL"]
+    #[ignore = "needs a disposable queue at QUEUE_URL"]
     async fn a_score_job_round_trips_through_the_broker() {
-        let url = std::env::var("RABBITMQ_URL").unwrap();
+        let url = std::env::var("QUEUE_URL").unwrap();
         assert!(
             url.contains("localhost") || url.contains("127.0.0.1"),
-            "refusing to purge a non-local broker queue"
+            "refusing to purge a non-local queue"
         );
         let queue = Queue::connect(&url).await.unwrap();
         let guard = queue.session.lock().await;

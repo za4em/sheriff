@@ -10,7 +10,7 @@ pub struct Config {
     pub(crate) window: i64,
     pub(crate) threshold: f64,
     pub(crate) workers: usize,
-    pub(crate) rabbitmq_url: String,
+    pub(crate) queue_url: String,
 }
 
 pub struct ServerConfig {
@@ -38,7 +38,7 @@ impl Config {
             window: window()?,
             threshold: threshold()?,
             workers,
-            rabbitmq_url: required("RABBITMQ_URL")?,
+            queue_url: required("QUEUE_URL")?,
         })
     }
 }

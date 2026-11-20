@@ -21,7 +21,7 @@ impl App {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         let provider = Provider::from_config(config.provider)?;
-        let queue = Queue::connect(&config.rabbitmq_url).await?;
+        let queue = Queue::connect(&config.queue_url).await?;
         let engine = Engine::new(pool, provider, config.window, config.threshold, queue)?;
         engine.serve(config.workers);
         Ok(Self {
