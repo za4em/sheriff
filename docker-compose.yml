@@ -1,4 +1,22 @@
 services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://sheriff:sheriff@postgres:5432/sheriff
+      QUEUE_URL: amqp://sheriff:sheriff@queue:5672/%2f
+      CACHE_URL: redis://cache:6379
+      SHERIFF_API_KEY: dev-key
+      SHERIFF_PROVIDER: mock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+
   postgres:
     image: postgres:17-alpine
     ports:
