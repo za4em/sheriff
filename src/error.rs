@@ -17,6 +17,7 @@ pub(crate) enum AppError {
     WebhookUrlInvalid,
     WebhookEncode,
     InvalidLimit,
+    ScoreTimeout,
     Database { action: &'static str },
     Queue { action: &'static str },
     Provider(Fault),
@@ -55,6 +56,7 @@ fn status(err: &AppError) -> StatusCode {
         | AppError::WebhookUrlRequired
         | AppError::WebhookUrlInvalid
         | AppError::InvalidLimit => StatusCode::BAD_REQUEST,
+        AppError::ScoreTimeout => StatusCode::GATEWAY_TIMEOUT,
         AppError::WebhookEncode | AppError::Database { .. } | AppError::Queue { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -80,6 +82,7 @@ fn client_message(err: &AppError) -> String {
         }
         AppError::WebhookEncode => "A webhook body could not be encoded.".to_owned(),
         AppError::InvalidLimit => "A limit must be from 1 to 100.".to_owned(),
+        AppError::ScoreTimeout => "Scoring did not finish in time.".to_owned(),
         AppError::Database { action } => format!("The database failed while {action}."),
         AppError::Queue { action } => format!("The queue failed while {action}."),
         AppError::Provider(fault) => {
