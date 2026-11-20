@@ -22,6 +22,7 @@ use wait::{ScoreWait, WaitList, Waiter};
 pub(crate) type SocketSender = mpsc::UnboundedSender<Decision>;
 
 const SCORE_WAIT: Duration = Duration::from_secs(5);
+const QUEUE_DEPTH_EVERY: Duration = Duration::from_secs(5);
 
 type RoomWindows = BTreeMap<String, Vec<Message>>;
 
@@ -62,6 +63,7 @@ impl Engine {
     /// Workers score jobs. The observer delivers sockets and webhooks.
     /// The sweeper republishes pending decisions left behind by a crash.
     pub(crate) async fn serve(&self, workers: usize) {
+        watch_queue_depth(self.queue.clone(), self.metrics.clone());
         let ready_decisions = self.cache.listen_decisions().await;
         let observer = self.clone();
         tokio::spawn(async move { observer.observe(ready_decisions).await });
@@ -245,6 +247,19 @@ impl Engine {
             Err(_) => Err(AppError::ScoreTimeout),
         }
     }
+}
+
+fn watch_queue_depth(queue: Queue, metrics: Metrics) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(QUEUE_DEPTH_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Ok(depth) = queue.depth().await {
+                metrics.set_queue_depth(depth);
+            }
+        }
+    });
 }
 
 async fn windows(
