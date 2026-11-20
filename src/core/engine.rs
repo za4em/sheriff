@@ -51,7 +51,7 @@ impl Engine {
             pool: pool.clone(),
             messages: Messages::new(pool.clone(), window),
             decisions: Decisions::new(pool.clone(), provider, threshold, metrics.clone()),
-            webhooks: Webhooks::new(pool)?,
+            webhooks: Webhooks::new(pool, metrics.clone())?,
             queue,
             cache,
             waiting: WaitList::default(),

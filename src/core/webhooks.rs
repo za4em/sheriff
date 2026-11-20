@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use super::decisions::Decision;
 use crate::error::AppError;
+use crate::metrics::Metrics;
 
 const SIGNATURE: &str = "X-Sheriff-Signature";
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,12 +28,17 @@ pub(crate) struct RegisteredEndpoint {
 pub(crate) struct Webhooks {
     pool: PgPool,
     http: reqwest::Client,
+    metrics: Metrics,
 }
 
 impl Webhooks {
-    pub(crate) fn new(pool: PgPool) -> Result<Self, reqwest::Error> {
+    pub(crate) fn new(pool: PgPool, metrics: Metrics) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder().timeout(TIMEOUT).build()?;
-        Ok(Self { pool, http })
+        Ok(Self {
+            pool,
+            http,
+            metrics,
+        })
     }
 
     pub(crate) async fn register(
@@ -65,6 +71,7 @@ impl Webhooks {
     async fn post(&self, endpoint: &repository::Endpoint, body: &[u8]) {
         let Some(signature) = sign(&endpoint.secret, body) else {
             tracing::error!(url = %endpoint.url, "webhook body could not be signed");
+            self.metrics.webhook_failed();
             return;
         };
         match self
@@ -83,9 +90,11 @@ impl Webhooks {
                     status = %response.status(),
                     "webhook delivery failed"
                 );
+                self.metrics.webhook_failed();
             }
             Err(err) => {
                 tracing::error!(url = %endpoint.url, error = %err, "webhook delivery failed");
+                self.metrics.webhook_failed();
             }
         }
     }
