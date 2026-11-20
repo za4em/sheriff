@@ -77,6 +77,29 @@ impl Queue {
         unreachable!("the second publish attempt returns")
     }
 
+    /// Messages waiting to be delivered. Jobs a worker already took are not included.
+    pub(crate) async fn depth(&self) -> Result<u32, AppError> {
+        let channel = {
+            let guard = self.session.lock().await;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| queue("reading the score queue", "the broker is not connected"))?;
+            session.publisher.clone()
+        };
+        let declared = channel
+            .queue_declare(
+                SCORE_QUEUE.into(),
+                QueueDeclareOptions {
+                    passive: true,
+                    ..QueueDeclareOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| queue("reading the score queue", err))?;
+        Ok(declared.message_count())
+    }
+
     /// One task owns the consumer and hands each delivery to a worker.
     /// Prefetch matches the worker count, so the broker does not park a backlog in this process.
     pub(crate) fn listen(self, workers: usize) -> Jobs {
