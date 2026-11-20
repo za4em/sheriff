@@ -32,10 +32,23 @@ struct Session {
     publisher: Channel,
 }
 
+/// Publishes score jobs and runs the one consumer that feeds workers.
 #[derive(Clone)]
 pub(crate) struct Queue {
     url: String,
     session: Arc<Mutex<Option<Session>>>,
+}
+
+/// Shared inbox. The lock is held only while taking the next job, not while scoring it.
+#[derive(Clone)]
+pub(crate) struct Jobs {
+    incoming: Arc<Mutex<mpsc::Receiver<JobDelivery>>>,
+}
+
+impl Jobs {
+    pub(crate) async fn recv(&self) -> Option<JobDelivery> {
+        self.incoming.lock().await.recv().await
+    }
 }
 
 impl Queue {
@@ -62,6 +75,17 @@ impl Queue {
             }
         }
         unreachable!("the second publish attempt returns")
+    }
+
+    /// One task owns the consumer and hands each delivery to a worker.
+    /// Prefetch matches the worker count, so the broker does not park a backlog in this process.
+    pub(crate) fn listen(self, workers: usize) -> Jobs {
+        let prefetch = u16::try_from(workers).unwrap_or(u16::MAX);
+        let (tx, rx) = mpsc::channel(workers.max(1));
+        tokio::spawn(async move { dispatch(self, prefetch, tx).await });
+        Jobs {
+            incoming: Arc::new(Mutex::new(rx)),
+        }
     }
 
     async fn publish_once(&self, body: &[u8]) -> Result<(), AppError> {
@@ -111,6 +135,32 @@ impl Queue {
         }
     }
 
+    async fn connection(&self) -> Result<Arc<Connection>, AppError> {
+        let guard = self.session.lock().await;
+        guard
+            .as_ref()
+            .map(|session| Arc::clone(&session.connection))
+            .ok_or_else(|| queue("connecting to the broker", "the broker is not connected"))
+    }
+
+    async fn open_consumer(&self, prefetch: u16) -> Result<Consumer, AppError> {
+        let connection = match self.connection().await {
+            Ok(connection) => connection,
+            Err(_) => {
+                self.reconnect().await;
+                self.connection().await?
+            }
+        };
+        match consume(connection.as_ref(), prefetch).await {
+            Ok(consumer) => Ok(consumer),
+            Err(err) => {
+                self.reconnect().await;
+                let connection = self.connection().await?;
+                consume(connection.as_ref(), prefetch).await.or(Err(err))
+            }
+        }
+    }
+
     async fn open_session(url: &str) -> Result<Session, lapin::Error> {
         let connection = Arc::new(Connection::connect(url, ConnectionProperties::default()).await?);
         let publisher = connection.create_channel().await?;
@@ -124,6 +174,68 @@ impl Queue {
             publisher,
         })
     }
+}
+
+async fn dispatch(queue: Queue, prefetch: u16, tx: mpsc::Sender<JobDelivery>) {
+    loop {
+        let mut consumer = match queue.open_consumer(prefetch).await {
+            Ok(consumer) => consumer,
+            Err(err) => {
+                tracing::error!(error = %err, "score consumer could not connect");
+                tokio::time::sleep(REQUEUE_PAUSE).await;
+                continue;
+            }
+        };
+        loop {
+            match consumer.next().await {
+                Some(Ok(delivery)) => match serde_json::from_slice(&delivery.data) {
+                    Ok(job) => {
+                        if tx.send(JobDelivery::new(job, delivery)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "score job could not be read");
+                        let _ = delivery
+                            .ack(lapin::options::BasicAckOptions::default())
+                            .await;
+                    }
+                },
+                Some(Err(err)) => {
+                    tracing::error!(error = %err, "score consumer failed");
+                    break;
+                }
+                None => {
+                    tracing::error!("score consumer ended");
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(REQUEUE_PAUSE).await;
+    }
+}
+
+async fn consume(connection: &Connection, prefetch: u16) -> Result<Consumer, AppError> {
+    let channel = connection
+        .create_channel()
+        .await
+        .map_err(|err| queue("opening a score channel", err))?;
+    declare_score_queue(&channel)
+        .await
+        .map_err(|err| queue("declaring the score queue", err))?;
+    channel
+        .basic_qos(prefetch, BasicQosOptions::default())
+        .await
+        .map_err(|err| queue("setting score prefetch", err))?;
+    channel
+        .basic_consume(
+            SCORE_QUEUE.into(),
+            CONSUMER_TAG.into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|err| queue("consuming score jobs", err))
 }
 
 async fn declare_score_queue(channel: &Channel) -> Result<(), lapin::Error> {
