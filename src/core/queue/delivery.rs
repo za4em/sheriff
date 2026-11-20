@@ -1,17 +1,22 @@
+use std::time::Duration;
+
 use lapin::{
     message::Delivery,
     options::{BasicAckOptions, BasicNackOptions},
 };
 
-use super::{REQUEUE_PAUSE, ScoreJob};
+use super::ScoreJob;
 use crate::error::{AppError, queue};
 
-pub(crate) struct Incoming {
+pub(crate) const REQUEUE_PAUSE: Duration = Duration::from_secs(1);
+
+/// One broker delivery plus the job decoded from its body.
+pub(crate) struct JobDelivery {
     pub(crate) job: ScoreJob,
     delivery: Delivery,
 }
 
-impl Incoming {
+impl JobDelivery {
     pub(super) fn new(job: ScoreJob, delivery: Delivery) -> Self {
         Self { job, delivery }
     }
@@ -24,8 +29,8 @@ impl Incoming {
             .map_err(|err| queue("acknowledging a score job", err))
     }
 
-    pub(crate) async fn nack(self) -> Result<(), AppError> {
-        tokio::time::sleep(REQUEUE_PAUSE).await;
+    /// Puts the job back on the queue. The caller decides whether to wait first.
+    pub(crate) async fn requeue(self) -> Result<(), AppError> {
         self.delivery
             .nack(BasicNackOptions {
                 multiple: false,
