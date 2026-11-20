@@ -41,3 +41,7 @@ A message that could not be scored uses the same fields. `status` is `failed`, `
 `POST /v1/messages` takes the same JSON and returns `202`. The decision is stored. Sending the same `message_id` again stores another message and another decision, so a retry after a timeout can duplicate work. Register a webhook and Sheriff posts each finished decision there, including a decision that failed.
 
 `GET /v1/stream` is the same save, over a websocket. Send the JSON array as a text frame. Each decision arrives later as its own text frame. A problem before the job starts arrives immediately as `{"error":"..."}`.
+
+## RabbitMQ and Redis
+
+RabbitMQ lets several instances share the scoring work. Redis wakes the instance still holding the HTTP call or websocket when another instance finishes the job.
