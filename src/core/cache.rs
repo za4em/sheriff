@@ -13,6 +13,7 @@ use crate::error::{AppError, cache as failed};
 mod reader;
 
 const READY: &str = "sheriff.ready";
+const CLAIM_TTL_SECS: u64 = 86_400;
 
 /// One decision the worker has finished.
 #[derive(Clone, Copy)]
@@ -73,6 +74,21 @@ impl Cache {
         .await
         .map_err(|err| failed("recording a ready decision", err))?;
         Ok(())
+    }
+
+    /// True when this instance may post the webhook. Other instances lose.
+    pub(crate) async fn claim_webhook(&self, decision_id: i64) -> Result<bool, AppError> {
+        let mut connection = self.connection.clone();
+        let claimed: Option<String> = redis::cmd("SET")
+            .arg(format!("sheriff.hook.{decision_id}"))
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(CLAIM_TTL_SECS)
+            .query_async(&mut connection)
+            .await
+            .map_err(|err| failed("claiming a webhook", err))?;
+        Ok(claimed.is_some())
     }
 
     /// Resolves after the read cursor is set, so a job cannot finish unseen.
