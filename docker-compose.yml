@@ -9,6 +9,7 @@ services:
       CACHE_URL: redis://cache:6379
       SHERIFF_API_KEY: dev-key
       SHERIFF_PROVIDER: mock
+      SHERIFF_PROVIDER_LATENCY_MS: 100
     depends_on:
       postgres:
         condition: service_healthy
