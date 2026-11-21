@@ -53,3 +53,22 @@ RabbitMQ is the queue, on port 5672. A score job goes there so any instance can 
 ## Observability
 
 Prometheus, on port 9090, scrapes what the process records: decisions, latency, queue depth, retries, webhook failures, and open websockets. Grafana, on port 3001, shows that scrape.
+
+## Load testing
+
+k6 can run three load tests against the mock provider. Measured numbers are not written here yet.
+
+`loadtest/score.js` calls `POST /v1/score`. `loadtest/messages.js` calls `POST /v1/messages`. Both take:
+
+- `RATE`, requests per second. Default `20`.
+- `DURATION`, how long the run lasts. Default `2m`.
+- `BATCH`, messages in one request. Default `1`.
+
+`loadtest/ws.js` holds websockets open. It takes:
+
+- `VUS`, how many sockets stay open. Default `20`.
+- `HOLD_MS`, how many milliseconds each socket stays open. Default `120000`.
+- `BATCH`, messages in one send. Default `1`.
+- `INTERVAL_MS`, pause between sends on one socket. Default `1000`.
+
+How to start a run is in `loadtest/README.md`.
