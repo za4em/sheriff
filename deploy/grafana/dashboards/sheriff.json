@@ -75,12 +75,45 @@
       ]
     },
     {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Requests",
+      "description": "HTTP responses per second. 2xx and the websocket upgrade count as success. 4xx and 5xx count as fail.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 15, "spanNulls": true, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(sheriff_http_request_duration_seconds_count{status=~\"2..|101\"}[1m]))",
+          "legendFormat": "success"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(sheriff_http_request_duration_seconds_count{status=~\"[45]..\"}[1m]))",
+          "legendFormat": "fail"
+        }
+      ]
+    },
+    {
       "id": 3,
       "type": "timeseries",
       "title": "Actions and failed",
       "description": "Finished decisions per second by action, and failed.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -107,7 +140,7 @@
       "title": "Provider latency",
       "description": "Time spent waiting for the scoring provider.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -146,7 +179,7 @@
       "title": "Queue depth",
       "description": "Messages waiting on sheriff.score. Replicas report the same broker total, so this uses the max.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -173,7 +206,7 @@
       "title": "Retries",
       "description": "Score jobs the worker put back on the queue after a failure.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -200,7 +233,7 @@
       "title": "Webhook failures",
       "description": "Deliveries that got a non-2xx response, a transport error, or could not be signed.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -227,7 +260,7 @@
       "title": "Websocket connections",
       "description": "Open connections, summed across replicas.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
