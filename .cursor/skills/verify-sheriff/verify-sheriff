@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# Drive a disposable Sheriff. Kill only the pid and containers this file records.
+set -euo pipefail
+
+SKILL_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SKILL_DIR/../../.." && pwd)
+RUN_DIR="$SKILL_DIR/run"
+STATE="$RUN_DIR/current.env"
+EVIDENCE_ROOT="$SKILL_DIR/evidence"
+
+PG_PORT=55432
+REDIS_PORT=56379
+RABBIT_PORT=55672
+APP_PORT=3000
+API_KEY=verify-key
+
+die() {
+  printf 'verify-sheriff: %s\n' "$*" >&2
+  exit 1
+}
+
+fail_launch() {
+  docker rm -f "${PG_CONTAINER:-}" "${REDIS_CONTAINER:-}" "${RABBIT_CONTAINER:-}" >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]]; then
+    kill "$PID" 2>/dev/null || true
+  fi
+  rm -f "$STATE"
+  die "$@"
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+port_busy() {
+  local port=$1
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+load_state() {
+  [[ -f "$STATE" ]] || die "no verification instance. Run: $0 launch"
+  # shellcheck disable=SC1090
+  source "$STATE"
+}
+
+listener_pid() {
+  lsof -nP -iTCP:"$APP_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true
+}
+
+wait_until() {
+  local seconds=$1
+  shift
+  local deadline=$((SECONDS + seconds))
+  until "$@"; do
+    if ((SECONDS >= deadline)); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+pg_ready() {
+  docker exec "$PG_CONTAINER" pg_isready -U sheriff -d sheriff >/dev/null 2>&1
+}
+
+redis_ready() {
+  [[ $(docker exec "$REDIS_CONTAINER" redis-cli ping 2>/dev/null || true) == PONG ]]
+}
+
+rabbit_ready() {
+  docker exec "$RABBIT_CONTAINER" rabbitmq-diagnostics -q ping >/dev/null 2>&1
+}
+
+write_state() {
+  mkdir -p "$RUN_DIR"
+  cat >"$STATE" <<EOF
+RUN_ID=$RUN_ID
+PID=$PID
+CARGO_PID=${CARGO_PID:-}
+BASE_URL=http://127.0.0.1:$APP_PORT
+API_KEY=$API_KEY
+PG_CONTAINER=$PG_CONTAINER
+REDIS_CONTAINER=$REDIS_CONTAINER
+RABBIT_CONTAINER=$RABBIT_CONTAINER
+PG_PORT=$PG_PORT
+REDIS_PORT=$REDIS_PORT
+RABBIT_PORT=$RABBIT_PORT
+LOG=$LOG
+GIT_SHA=$GIT_SHA
+EOF
+}
+
+cmd_launch() {
+  need docker
+  need cargo
+  need curl
+  need lsof
+  if [[ -f "$STATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE"
+    if kill -0 "$PID" 2>/dev/null; then
+      die "instance $RUN_ID is already running as pid $PID. Refusing to start a second one."
+    fi
+  fi
+  if port_busy "$APP_PORT"; then
+    die "port $APP_PORT is already in use. Sheriff always binds 0.0.0.0:$APP_PORT, so this run will not start a second server."
+  fi
+  if port_busy "$PG_PORT"; then
+    die "port $PG_PORT is already in use. Verification postgres will not attach to it."
+  fi
+  if port_busy "$REDIS_PORT"; then
+    die "port $REDIS_PORT is already in use. Verification redis will not attach to it."
+  fi
+  if port_busy "$RABBIT_PORT"; then
+    die "port $RABBIT_PORT is already in use. Verification rabbitmq will not attach to it."
+  fi
+
+  RUN_ID=$(date +%Y%m%d%H%M%S)-$$
+  PG_CONTAINER=sheriff-verify-pg-$RUN_ID
+  REDIS_CONTAINER=sheriff-verify-redis-$RUN_ID
+  RABBIT_CONTAINER=sheriff-verify-rabbit-$RUN_ID
+  LOG=$RUN_DIR/$RUN_ID.log
+  GIT_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+  mkdir -p "$RUN_DIR"
+
+  cleanup_partial() {
+    docker rm -f "$PG_CONTAINER" "$REDIS_CONTAINER" "$RABBIT_CONTAINER" >/dev/null 2>&1 || true
+    if [[ -n "${PID:-}" ]]; then
+      kill "$PID" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_partial ERR
+
+  docker run -d --name "$PG_CONTAINER" \
+    -e POSTGRES_USER=sheriff \
+    -e POSTGRES_PASSWORD=sheriff \
+    -e POSTGRES_DB=sheriff \
+    -p "127.0.0.1:$PG_PORT:5432" \
+    postgres:17-alpine >/dev/null
+  docker run -d --name "$REDIS_CONTAINER" \
+    -p "127.0.0.1:$REDIS_PORT:6379" \
+    redis:8-alpine >/dev/null
+  # The rabbitmq user cannot read its mode-0400 Erlang cookie on this Docker
+  # Desktop (eacces). Root owns that cookie and can read it. The broker still
+  # listens on 5672 inside the container and uses the sheriff user.
+  docker run -d --name "$RABBIT_CONTAINER" \
+    --user root \
+    --entrypoint rabbitmq-server \
+    -e RABBITMQ_DEFAULT_USER=sheriff \
+    -e RABBITMQ_DEFAULT_PASS=sheriff \
+    -e RABBITMQ_ERLANG_COOKIE=sheriff-verify \
+    -p "127.0.0.1:$RABBIT_PORT:5672" \
+    rabbitmq:4-management-alpine >/dev/null
+
+  wait_until 90 pg_ready || fail_launch "postgres $PG_CONTAINER did not become ready"
+  wait_until 30 redis_ready || fail_launch "redis $REDIS_CONTAINER did not become ready"
+  wait_until 120 rabbit_ready || fail_launch "rabbitmq $RABBIT_CONTAINER did not become ready"
+
+  # A new session, ignoring SIGHUP, so the server outlives the launch command.
+  : >"$LOG"
+  DATABASE_URL="postgres://sheriff:sheriff@127.0.0.1:$PG_PORT/sheriff" \
+    QUEUE_URL="amqp://sheriff:sheriff@127.0.0.1:$RABBIT_PORT/%2f" \
+    CACHE_URL="redis://127.0.0.1:$REDIS_PORT" \
+    SHERIFF_API_KEY="$API_KEY" \
+    SHERIFF_PROVIDER=mock \
+    SHERIFF_PROVIDER_LATENCY_MS=0 \
+    SHERIFF_WORKERS=4 \
+    python3 -c '
+import os, signal, sys
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+os.setsid()
+os.chdir(sys.argv[1])
+log = open(sys.argv[2], "wb", buffering=0)
+os.dup2(log.fileno(), 1)
+os.dup2(log.fileno(), 2)
+os.execvpe("cargo", ["cargo", "run", "--quiet"], os.environ)
+' "$REPO_ROOT" "$LOG" &
+  CARGO_PID=$!
+  disown "$CARGO_PID" 2>/dev/null || true
+  PID=$CARGO_PID
+  write_state
+
+  if ! wait_until 300 grep -q "listening on" "$LOG"; then
+    tail -n 40 "$LOG" >&2 || true
+    fail_launch "sheriff pid $CARGO_PID did not log 'listening on' within 300s"
+  fi
+  if ! kill -0 "$CARGO_PID" 2>/dev/null; then
+    tail -n 40 "$LOG" >&2 || true
+    fail_launch "cargo pid $CARGO_PID exited before sheriff was usable"
+  fi
+  # cargo run is the parent. The sheriff binary is the process bound to 3000.
+  if ! wait_until 30 bash -c "[[ -n \$(lsof -nP -iTCP:$APP_PORT -sTCP:LISTEN -t 2>/dev/null | head -n 1) ]]"; then
+    fail_launch "sheriff logged that it is listening, but nothing owns port $APP_PORT"
+  fi
+  local owner parent
+  owner=$(listener_pid)
+  parent=$(ps -o ppid= -p "$owner" | tr -d ' ')
+  if [[ "$owner" != "$CARGO_PID" && "$parent" != "$CARGO_PID" ]]; then
+    fail_launch "port $APP_PORT is owned by pid $owner, which cargo pid $CARGO_PID did not start"
+  fi
+  PID=$owner
+  write_state
+  trap - ERR
+  printf 'launched run %s pid %s log %s\n' "$RUN_ID" "$PID" "$LOG"
+  cmd_doctor
+}
+
+cmd_doctor() {
+  need curl
+  need lsof
+  load_state
+  local owner
+  owner=$(listener_pid)
+  kill -0 "$PID" 2>/dev/null || die "recorded pid $PID is not running"
+  [[ "$owner" == "$PID" ]] || die "port $APP_PORT is owned by pid ${owner:-none}, not the recorded pid $PID"
+  docker inspect -f '{{.State.Running}}' "$PG_CONTAINER" | grep -qx true || die "postgres container $PG_CONTAINER is not running"
+  docker inspect -f '{{.State.Running}}' "$REDIS_CONTAINER" | grep -qx true || die "redis container $REDIS_CONTAINER is not running"
+  docker inspect -f '{{.State.Running}}' "$RABBIT_CONTAINER" | grep -qx true || die "rabbitmq container $RABBIT_CONTAINER is not running"
+
+  local unauth
+  unauth=$(curl -sS -o /tmp/sheriff-verify-unauth-body -w '%{http_code}' \
+    -H 'content-type: application/json' \
+    -d '[{"message_id":"doctor","room_id":"room-doctor","user_id":"u","text":"hello","timestamp":1}]' \
+    "$BASE_URL/v1/score")
+  [[ "$unauth" == "401" ]] || die "auth check returned HTTP $unauth, want 401"
+
+  local authed body
+  body=$(mktemp)
+  authed=$(curl -sS -o "$body" -w '%{http_code}' \
+    -H "authorization: Bearer $API_KEY" \
+    -H 'content-type: application/json' \
+    -d '[{"message_id":"doctor-auth","room_id":"room-doctor","user_id":"u","text":"hello","timestamp":1}]' \
+    "$BASE_URL/v1/score")
+  [[ "$authed" == "200" ]] || {
+    cat "$body" >&2 || true
+    die "score probe returned HTTP $authed, want 200"
+  }
+  python3 - "$body" <<'PY' || die "score probe body was not a ready allow decision"
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert isinstance(body, list) and len(body) == 1, body
+row = body[0]
+assert row["status"] == "ready", row
+assert row["action"] == "allow", row
+assert row["error"] is None, row
+PY
+  rm -f "$body" /tmp/sheriff-verify-unauth-body
+  printf 'doctor ok run %s pid %s git %s url %s\n' "$RUN_ID" "$PID" "$GIT_SHA" "$BASE_URL"
+}
+
+cmd_request() {
+  need curl
+  need python3
+  load_state
+  local name="" expect="" auth=1 feature="score-batch"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      --expect) expect=$2; shift 2 ;;
+      --feature) feature=$2; shift 2 ;;
+      --no-auth) auth=0; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [[ $# -ge 2 ]] || die "usage: $0 request [--name ID] [--expect STATUS] [--feature ID] [--no-auth] METHOD PATH [JSON]"
+  local method=$1 path=$2 json=${3:-}
+  [[ -n "$name" ]] || name=$(date +%H%M%S)
+  local dir="$EVIDENCE_ROOT/$feature/$RUN_ID"
+  mkdir -p "$dir"
+  local req="$dir/$name.request.json"
+  local hdr="$dir/$name.headers.txt"
+  local body="$dir/$name.body"
+  local status_file="$dir/$name.status"
+  if [[ -n "$json" ]]; then
+    printf '%s\n' "$json" >"$req"
+  else
+    printf '\n' >"$req"
+  fi
+  local -a curl_cmd
+  curl_cmd=(curl -sS -D "$hdr" -o "$body" -w '%{http_code}')
+  if [[ "$auth" == 1 ]]; then
+    curl_cmd+=(-H "authorization: Bearer $API_KEY")
+  fi
+  if [[ -n "$json" ]]; then
+    curl_cmd+=(-H "content-type: application/json" -X "$method" --data "$json")
+  else
+    curl_cmd+=(-X "$method")
+  fi
+  curl_cmd+=("$BASE_URL$path")
+  local code
+  code=$("${curl_cmd[@]}")
+  printf '%s\n' "$code" >"$status_file"
+  printf 'evidence %s status %s\n' "$dir/$name" "$code"
+  cat "$body"
+  printf '\n'
+  if [[ -n "$expect" && "$code" != "$expect" ]]; then
+    die "HTTP $code, want $expect. Body kept at $body"
+  fi
+}
+
+cmd_stream() {
+  need python3
+  load_state
+  local text=${1:-hello}
+  local message_id=${2:-m-stream}
+  local dir="$EVIDENCE_ROOT/stream-decisions/$RUN_ID"
+  mkdir -p "$dir"
+  python3 - "$BASE_URL" "$API_KEY" "$text" "$message_id" "$dir/roundtrip.body" <<'PY'
+import base64, json, os, socket, sys
+from urllib.parse import urlparse
+
+base, api_key, text, message_id, out_path = sys.argv[1:]
+parsed = urlparse(base)
+host = parsed.hostname or "127.0.0.1"
+port = parsed.port or 3000
+key = base64.b64encode(os.urandom(16)).decode()
+request = (
+    "GET /v1/stream HTTP/1.1\r\n"
+    f"Host: {host}:{port}\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    f"Authorization: Bearer {api_key}\r\n"
+    "\r\n"
+)
+sock = socket.create_connection((host, port), timeout=10)
+sock.sendall(request.encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("websocket upgrade closed before headers")
+    buf += chunk
+head, rest = buf.split(b"\r\n\r\n", 1)
+status_line = head.split(b"\r\n", 1)[0].decode()
+if " 101 " not in status_line:
+    sys.exit(f"websocket upgrade failed: {status_line}")
+
+payload = json.dumps([{
+    "message_id": message_id,
+    "room_id": "room-stream",
+    "user_id": "u1",
+    "text": text,
+    "timestamp": 1710000000,
+}]).encode()
+
+def mask_frame(data):
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    n = len(data)
+    header = bytes([0x81, 0x80 | n]) if n < 126 else bytes([0x81, 0xFE]) + n.to_bytes(2, "big")
+    # 0x80 marks masked. Lengths of 126+ need the extended form with the mask bit.
+    if n >= 126:
+        header = bytes([0x81, 0xFE]) + n.to_bytes(2, "big")
+    return header + mask + masked
+
+sock.sendall(mask_frame(payload))
+
+def read_exact(n):
+    got = b""
+    while len(got) < n:
+        chunk = sock.recv(n - len(got))
+        if not chunk:
+            sys.exit("websocket closed while reading a frame")
+        got += chunk
+    return got
+
+# A decision frame is unmasked text from the server. Ignore leftover upgrade bytes.
+pending = rest
+while True:
+    while len(pending) < 2:
+        pending += read_exact(2 - len(pending))
+    b0, b1 = pending[0], pending[1]
+    pending = pending[2:]
+    opcode = b0 & 0x0F
+    masked = b1 & 0x80
+    length = b1 & 0x7F
+    if length == 126:
+        extra = read_exact(2) if len(pending) < 2 else pending[:2]
+        pending = pending[2:] if len(pending) >= 2 else b""
+        length = int.from_bytes(extra, "big")
+    if masked:
+        sys.exit("server frame was masked")
+    if len(pending) < length:
+        pending += read_exact(length - len(pending))
+    data, pending = pending[:length], pending[length:]
+    if opcode == 0x1:
+        open(out_path, "w").write(data.decode())
+        print(data.decode())
+        sock.close()
+        break
+    if opcode == 0x8:
+        sys.exit("websocket closed before a decision")
+PY
+}
+
+cmd_cleanup() {
+  if [[ ! -f "$STATE" ]]; then
+    printf 'no instance to clean up\n'
+    exit 0
+  fi
+  # shellcheck disable=SC1090
+  source "$STATE"
+  local pid
+  for pid in "${PID:-}" "${CARGO_PID:-}"; do
+    [[ -n "$pid" ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  local deadline=$((SECONDS + 10))
+  for pid in "${PID:-}" "${CARGO_PID:-}"; do
+    [[ -n "$pid" ]] || continue
+    while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do
+      sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  docker rm -f "${PG_CONTAINER:-}" "${REDIS_CONTAINER:-}" "${RABBIT_CONTAINER:-}" >/dev/null 2>&1 || true
+  rm -f "$STATE"
+  printf 'cleaned run %s. evidence remains in %s\n' "${RUN_ID:-unknown}" "$EVIDENCE_ROOT"
+}
+
+usage() {
+  cat <<EOF
+usage: verify-sheriff launch | doctor | request | stream | cleanup
+
+  launch    start disposable postgres, redis, rabbitmq, and sheriff
+  doctor    check the recorded pid owns port $APP_PORT and auth works
+  request   send one HTTP call and keep the status, headers, and body
+  stream    open /v1/stream, send one message, print the decision frame
+  cleanup   stop the recorded pid and remove the recorded containers
+EOF
+}
+
+main() {
+  local cmd=${1:-}
+  shift || true
+  case "$cmd" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    request) cmd_request "$@" ;;
+    stream) cmd_stream "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
