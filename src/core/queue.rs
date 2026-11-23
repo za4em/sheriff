@@ -4,8 +4,8 @@ use futures_lite::StreamExt;
 use lapin::{
     BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
     options::{
-        BasicConsumeOptions, BasicPublishOptions, BasicQosOptions, ConfirmSelectOptions,
-        QueueDeclareOptions,
+        BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
+        ConfirmSelectOptions, QueueDeclareOptions,
     },
     types::FieldTable,
 };
@@ -219,9 +219,7 @@ async fn dispatch(queue: Queue, prefetch: u16, tx: mpsc::Sender<JobDelivery>) {
                     }
                     Err(err) => {
                         tracing::error!(error = %err, "score job could not be read");
-                        let _ = delivery
-                            .ack(lapin::options::BasicAckOptions::default())
-                            .await;
+                        let _ = delivery.ack(BasicAckOptions::default()).await;
                     }
                 },
                 Some(Err(err)) => {

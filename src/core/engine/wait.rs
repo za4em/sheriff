@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, error::RecvError};
 
 use super::SocketSender;
 
@@ -30,7 +30,7 @@ pub(super) struct ScoreWait {
 }
 
 impl ScoreWait {
-    pub(super) async fn finished(mut self) -> Result<(), oneshot::error::RecvError> {
+    pub(super) async fn finished(mut self) -> Result<(), RecvError> {
         let result = (&mut self.receiver).await;
         self.armed = false;
         result

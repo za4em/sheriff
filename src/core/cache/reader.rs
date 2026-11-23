@@ -2,7 +2,8 @@
 
 use std::time::Duration;
 
-use redis::streams::StreamReadOptions;
+use redis::aio::MultiplexedConnection;
+use redis::streams::{StreamId, StreamRangeReply, StreamReadOptions, StreamReadReply};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{READY, ReadyDecision};
@@ -30,7 +31,7 @@ impl Cursor {
 
     async fn resume(
         &mut self,
-        connection: &mut redis::aio::MultiplexedConnection,
+        connection: &mut MultiplexedConnection,
         ready: &mut Option<oneshot::Sender<()>>,
     ) -> Result<(), redis::RedisError> {
         if self.started {
@@ -106,9 +107,7 @@ async fn read_decisions(
     }
 }
 
-async fn reader(
-    client: &redis::Client,
-) -> Result<redis::aio::MultiplexedConnection, redis::RedisError> {
+async fn reader(client: &redis::Client) -> Result<MultiplexedConnection, redis::RedisError> {
     let config = redis::AsyncConnectionConfig::new().set_response_timeout(Some(READ_TIMEOUT));
     client
         .get_multiplexed_async_connection_with_config(&config)
@@ -117,25 +116,21 @@ async fn reader(
 
 /// An idle block is a nil reply: an empty read, not a dropped connection.
 async fn batch(
-    connection: &mut redis::aio::MultiplexedConnection,
+    connection: &mut MultiplexedConnection,
     last_id: &str,
-) -> Result<Option<redis::streams::StreamReadReply>, redis::RedisError> {
+) -> Result<Option<StreamReadReply>, redis::RedisError> {
     let options = StreamReadOptions::default()
         .block(READ_BLOCK_MS)
         .count(READ_COUNT);
     redis::AsyncCommands::xread_options(connection, &[READY], &[last_id], &options).await
 }
 
-fn entries(
-    reply: &redis::streams::StreamReadReply,
-) -> impl Iterator<Item = &redis::streams::StreamId> {
+fn entries(reply: &StreamReadReply) -> impl Iterator<Item = &StreamId> {
     reply.keys.iter().flat_map(|key| key.ids.iter())
 }
 
-async fn latest_id(
-    connection: &mut redis::aio::MultiplexedConnection,
-) -> Result<String, redis::RedisError> {
-    let reply: redis::streams::StreamRangeReply =
+async fn latest_id(connection: &mut MultiplexedConnection) -> Result<String, redis::RedisError> {
+    let reply: StreamRangeReply =
         redis::AsyncCommands::xrevrange_count(connection, READY, "+", "-", 1usize).await?;
     Ok(reply
         .ids
@@ -145,7 +140,7 @@ async fn latest_id(
         .unwrap_or_else(|| "0-0".to_owned()))
 }
 
-fn parse_ready_decision(entry: &redis::streams::StreamId) -> Option<ReadyDecision> {
+fn parse_ready_decision(entry: &StreamId) -> Option<ReadyDecision> {
     let decision_id = redis::from_redis_value_ref(entry.map.get("decision_id")?).ok()?;
     let completed_now = entry
         .map
@@ -164,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_ready_entry_carries_the_decision_id() {
-        let mut entry = redis::streams::StreamId::default();
+        let mut entry = StreamId::default();
         entry
             .map
             .insert("decision_id".to_owned(), redis::Value::Int(7));

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 
 use super::cache::{Cache, ReadyDecision};
 use super::decisions::{Decision, Decisions};
@@ -265,7 +266,7 @@ impl Engine {
 fn watch_queue_depth(queue: Queue, metrics: Metrics) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(QUEUE_DEPTH_EVERY);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             if let Ok(depth) = queue.depth().await {

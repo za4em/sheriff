@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use tokio::net::TcpListener;
+
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -14,7 +16,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = sheriff::Config::from_env()?;
     let bind_address = config.server.bind_address.clone();
     let app = sheriff::App::connect(config).await?;
-    let listener = tokio::net::TcpListener::bind(bind_address).await?;
+    let listener = TcpListener::bind(bind_address).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
     axum::serve(listener, sheriff::router(app)).await?;
     Ok(())

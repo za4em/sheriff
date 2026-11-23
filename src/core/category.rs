@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::AppError;
 
@@ -114,7 +115,7 @@ impl Category {
 
     pub(crate) fn key(self) -> String {
         match serde_json::to_value(self) {
-            Ok(serde_json::Value::String(name)) => name,
+            Ok(Value::String(name)) => name,
             other => panic!("a category serializes as a string, got {other:?}"),
         }
     }
