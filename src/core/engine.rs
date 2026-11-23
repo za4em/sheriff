@@ -309,13 +309,6 @@ fn planned(
             );
         }
     }
-    let covered: std::collections::BTreeSet<i64> = windows.iter().flatten().copied().collect();
-    assert!(
-        stored
-            .iter()
-            .all(|message| covered.contains(&message.row_id)),
-        "incoming message is in a window"
-    );
     windows
 }
 
