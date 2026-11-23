@@ -19,7 +19,7 @@ Run it when a change edits any of these:
 - `src/core/cache.rs` `ready_decision`, `claim_webhook`
 - `src/core/cache/reader.rs` `follow_decisions`
 
-The model was last confirmed against commit `76aec26b78f29e9b40f590a9b316a02e81003469`. If one of those functions changed after that commit, the model may be stale. Do not move the commit forward until you have read the new code, updated the model if a step changed, and this check passes. A passing run on a stale model is not a pass for the new code.
+The model was last confirmed against commit `31c1dddb1f2ca23df1208e986beec81736e93a12`. If one of those functions changed after that commit, the model may be stale. Do not move the commit forward until you have read the new code, updated the model if a step changed, and this check passes. A passing run on a stale model is not a pass for the new code.
 
 ## Run
 
