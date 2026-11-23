@@ -1,3 +1,7 @@
 docs/
 /target
 .env
+*.log
+.cursor/skills/verify-sheriff/evidence/
+.cursor/skills/verify-sheriff/run/
+.cursor/skills/verify-sheriff-webhook/states/
