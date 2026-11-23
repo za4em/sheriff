@@ -1,0 +1,6 @@
+---
+description: Rust style checks for Sheriff
+alwaysApply: true
+---
+
+Before you finish a Rust change, run `python3 scripts/rust_style.py`. It must pass. The rules and the names they require are in AGENTS.md. `python3 scripts/rust_style.py --self-test` checks the old mistakes still fail.
