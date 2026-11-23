@@ -1,6 +1,6 @@
 use crate::core::cache::Cache;
 use crate::core::category::{Action, Category};
-use crate::core::decisions::{CategoryScores, Decisions, Screen, Status};
+use crate::core::decisions::{CategoryScores, Decision, Decisions, Status, WindowVerdict};
 use crate::core::messages::{Message, Messages};
 use crate::core::provider::JUDGED;
 use crate::core::queue::{Jobs, REQUEUE_PAUSE, ScoreJob};
@@ -19,7 +19,7 @@ pub(super) async fn work(
             return;
         };
         let decision_id = delivery.job.decision_id;
-        match run(&delivery.job, &decisions, &messages, &cache).await {
+        match score_group(&delivery.job, &decisions, &messages, &cache).await {
             Ok(()) => {
                 if let Err(err) = delivery.ack().await {
                     tracing::error!(error = %err, decision_id, "score job could not be acknowledged");
@@ -48,7 +48,22 @@ struct Open {
     failure: Option<String>,
 }
 
-async fn run(
+fn open_rows(group: Vec<Decision>) -> Vec<Open> {
+    group
+        .into_iter()
+        .map(|decision| Open {
+            id: decision.id,
+            message_row_id: decision.message_row_id,
+            pending: decision.status == Status::Pending,
+            completed_now: false,
+            published: false,
+            first_hit: None,
+            failure: None,
+        })
+        .collect()
+}
+
+async fn score_group(
     job: &ScoreJob,
     decisions: &Decisions,
     messages: &Messages,
@@ -68,20 +83,9 @@ async fn run(
         }
         return Ok(());
     }
+    let mut open = open_rows(group);
     let windows = decisions.windows(&seed.group_id).await?;
-    let mut open = group
-        .into_iter()
-        .map(|decision| Open {
-            id: decision.id,
-            message_row_id: decision.message_row_id,
-            pending: decision.status == Status::Pending,
-            completed_now: false,
-            published: false,
-            first_hit: None,
-            failure: None,
-        })
-        .collect::<Vec<_>>();
-    let hits = screen(
+    let hits = classify_windows(
         decisions,
         messages,
         cache,
@@ -105,7 +109,7 @@ async fn tell(cache: &Cache, row: &mut Open) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn screen(
+async fn classify_windows(
     decisions: &Decisions,
     messages: &Messages,
     cache: &Cache,
@@ -121,46 +125,71 @@ async fn screen(
         {
             continue;
         }
-        let loaded = messages.get_many(tenant, window).await?;
-        if loaded.len() != window.len() {
-            for row in open.iter_mut() {
-                if row.pending && window.contains(&row.message_row_id) {
-                    row.completed_now = decisions
-                        .mark_failed(row.id, "The message could not be read.")
-                        .await?;
-                    row.pending = false;
-                    tell(cache, row).await?;
-                }
-            }
-            continue;
-        }
-        match decisions.screen(&batch_lines(&loaded)).await {
-            Ok(Screen::Clean) => {}
-            Ok(Screen::Hit) => {
-                let index = hits.len();
-                for row in open.iter_mut() {
-                    if row.pending
-                        && row.first_hit.is_none()
-                        && window.contains(&row.message_row_id)
-                    {
-                        row.first_hit = Some(index);
-                    }
-                }
-                hits.push(loaded);
-            }
-            Err(err @ AppError::Provider(_)) => {
-                let message = err.to_string();
-                for row in open.iter_mut() {
-                    if row.pending && row.failure.is_none() && window.contains(&row.message_row_id)
-                    {
-                        row.failure = Some(message.clone());
-                    }
-                }
-            }
-            Err(err) => return Err(err),
-        }
+        classify_window(decisions, messages, cache, tenant, window, open, &mut hits).await?;
     }
     Ok(hits)
+}
+
+async fn classify_window(
+    decisions: &Decisions,
+    messages: &Messages,
+    cache: &Cache,
+    tenant: &str,
+    window: &[i64],
+    open: &mut [Open],
+    hits: &mut Vec<Vec<Message>>,
+) -> Result<(), AppError> {
+    let loaded = messages.get_many(tenant, window).await?;
+    if loaded.len() != window.len() {
+        return fail_unread(decisions, cache, open, window).await;
+    }
+    match decisions.judge_window(&batch_lines(&loaded)).await {
+        Ok(WindowVerdict::Clean) => Ok(()),
+        Ok(WindowVerdict::Hit) => {
+            note_first_hit(open, window, hits.len());
+            hits.push(loaded);
+            Ok(())
+        }
+        Err(err @ AppError::Provider(_)) => {
+            note_failure(open, window, err.to_string());
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn fail_unread(
+    decisions: &Decisions,
+    cache: &Cache,
+    open: &mut [Open],
+    window: &[i64],
+) -> Result<(), AppError> {
+    for row in open.iter_mut() {
+        if row.pending && window.contains(&row.message_row_id) {
+            row.completed_now = decisions
+                .mark_failed(row.id, "The message could not be read.")
+                .await?;
+            row.pending = false;
+            tell(cache, row).await?;
+        }
+    }
+    Ok(())
+}
+
+fn note_first_hit(open: &mut [Open], window: &[i64], index: usize) {
+    for row in open.iter_mut() {
+        if row.pending && row.first_hit.is_none() && window.contains(&row.message_row_id) {
+            row.first_hit = Some(index);
+        }
+    }
+}
+
+fn note_failure(open: &mut [Open], window: &[i64], message: String) {
+    for row in open.iter_mut() {
+        if row.pending && row.failure.is_none() && window.contains(&row.message_row_id) {
+            row.failure = Some(message.clone());
+        }
+    }
 }
 
 async fn finish(

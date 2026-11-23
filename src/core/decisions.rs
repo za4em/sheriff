@@ -15,7 +15,7 @@ const FAILED: &str = "failed";
 
 pub(crate) type CategoryScores = BTreeMap<Category, f64>;
 
-pub(crate) enum Screen {
+pub(crate) enum WindowVerdict {
     Clean,
     Hit,
 }
@@ -101,7 +101,7 @@ impl Decisions {
         Ok((chosen, categories))
     }
 
-    pub(crate) async fn screen(&self, state: &str) -> Result<Screen, AppError> {
+    pub(crate) async fn judge_window(&self, state: &str) -> Result<WindowVerdict, AppError> {
         let questions = batch_questions();
         let started = Instant::now();
         let decided = self.provider.decide(state, &questions).await;
@@ -109,9 +109,9 @@ impl Decisions {
         let probabilities = decided.map_err(AppError::Provider)?;
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
         if hits(&categories, self.threshold).is_empty() {
-            Ok(Screen::Clean)
+            Ok(WindowVerdict::Clean)
         } else {
-            Ok(Screen::Hit)
+            Ok(WindowVerdict::Hit)
         }
     }
 

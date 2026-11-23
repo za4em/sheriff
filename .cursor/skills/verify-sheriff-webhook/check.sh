@@ -39,9 +39,9 @@ ready = text("src/core/decisions/repository.rs").split("async fn mark_ready", 1)
 if "AND status = $4" not in ready or "Status::Pending" not in ready:
     sys.exit("mark_ready no longer updates only a pending row.")
 
-worker = text("src/core/engine/worker.rs").split("async fn run", 1)[1].split("async fn screen", 1)[0]
+worker = text("src/core/engine/worker.rs").split("async fn score_group", 1)[1].split("async fn classify_windows", 1)[0]
 if "Status::Pending" not in worker or "ready_decision" not in worker:
-    sys.exit("worker.rs run no longer publishes completed_now from the pending check and mark_ready.")
+    sys.exit("worker.rs score_group no longer publishes completed_now from the pending check and mark_ready.")
 
 reader = text("src/core/cache/reader.rs")
 if "xread_options" not in reader:

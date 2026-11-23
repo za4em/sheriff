@@ -9,7 +9,7 @@ const PENDING_AFTER: i64 = 30;
 const SWEEP_LIMIT: i64 = 100;
 
 /// Republishes decisions that are still pending after the provider should have finished.
-pub(super) async fn run(decisions: Decisions, queue: Queue) {
+pub(super) async fn watch_pending(decisions: Decisions, queue: Queue) {
     loop {
         if let Err(err) = republish(&decisions, &queue).await {
             tracing::error!(error = %err, "background work failed");

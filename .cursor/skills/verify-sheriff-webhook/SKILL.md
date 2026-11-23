@@ -14,7 +14,7 @@ The check is a TLA+ model of that handoff, run with TLC from `tla2tools` 1.7.4. 
 Run it when a change edits any of these:
 
 - `src/core/engine.rs` `observe`, `claim_webhook`, `webhook`
-- `src/core/engine/worker.rs` `run`
+- `src/core/engine/worker.rs` `score_group`
 - `src/core/decisions/repository.rs` `mark_ready`
 - `src/core/cache.rs` `ready_decision`, `claim_webhook`
 - `src/core/cache/reader.rs` `follow_decisions`
@@ -37,7 +37,7 @@ A passing run prints two lines: the claim holds for the faithful model, and the 
 
 Each action is one await in the Rust, not a whole request.
 
-- `ReadPending` is the group load in `worker.rs` `run` while this decision's `status` is `Pending`.
+- `ReadPending` is the group load in `worker.rs` `score_group` while this decision's `status` is `Pending`.
 - `ReadDone` is that load after this decision has left `Pending`. The worker publishes `completed_now` false.
 - `MarkReady` is `mark_ready`: `UPDATE decisions SET status = ready WHERE id = $1 AND status = pending`. At most one worker gets `true`.
 - `Publish` is `cache.ready_decision`, an `XADD` on `sheriff.ready`.
@@ -74,7 +74,7 @@ It does not cover:
 
 | Action | Code |
 |---|---|
-| `ReadPending`, `ReadDone`, `Publish` | `src/core/engine/worker.rs` `run` |
+| `ReadPending`, `ReadDone`, `Publish` | `src/core/engine/worker.rs` `score_group` |
 | `MarkReady` | `src/core/decisions/repository.rs` `mark_ready` |
 | `Observe` | `src/core/cache/reader.rs` `follow_decisions` |
 | `Claim` | `src/core/cache.rs` `claim_webhook` |

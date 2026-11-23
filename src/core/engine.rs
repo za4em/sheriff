@@ -77,7 +77,7 @@ impl Engine {
         let jobs = self.queue.clone().listen(workers);
         let sweep_decisions = self.decisions.clone();
         let sweep_queue = self.queue.clone();
-        tokio::spawn(async move { sweep::run(sweep_decisions, sweep_queue).await });
+        tokio::spawn(async move { sweep::watch_pending(sweep_decisions, sweep_queue).await });
         for _ in 0..workers {
             let jobs = jobs.clone();
             let decisions = self.decisions.clone();
