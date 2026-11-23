@@ -80,4 +80,4 @@ It does not cover:
 | `Claim` | `src/core/cache.rs` `claim_webhook` |
 | `Post` | `src/core/engine.rs` `observe`, `webhook` |
 
-Sync commit: `76aec26b78f29e9b40f590a9b316a02e81003469`.
+Sync commit: `fb68f7da1baeab44e7ec4072fd71f08b8fb7a996`.
