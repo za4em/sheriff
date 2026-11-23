@@ -146,7 +146,11 @@ impl Engine {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut waits = self.watch(&ids);
+        let mut waits: Vec<ScoreWait> = ids
+            .iter()
+            .copied()
+            .map(|id| self.waiting.reply(id))
+            .collect();
         let published = self.enqueue(&ids).await;
         waits.truncate(published);
         self.wait_for(waits).await?;
@@ -191,7 +195,9 @@ impl Engine {
         messages: &[IncomingMessage],
         retained: bool,
     ) -> Result<Vec<i64>, AppError> {
-        validate_all(messages)?;
+        for message in messages {
+            validate(message)?;
+        }
         if messages.is_empty() {
             return Ok(Vec::new());
         }
@@ -203,10 +209,10 @@ impl Engine {
             .map_err(|err| database("saving a batch", err))?;
         let mut stored = Vec::with_capacity(messages.len());
         for message in messages {
-            stored.push(super::messages::insert_on(&mut tx, tenant, message, retained).await?);
+            stored.push(super::messages::insert(&mut tx, tenant, message, retained).await?);
         }
         let ids =
-            super::decisions::insert_pending_on(&mut tx, tenant, &with_context(&windows, &stored))
+            super::decisions::insert_pending(&mut tx, tenant, &with_context(&windows, &stored))
                 .await?;
         tx.commit()
             .await
@@ -224,13 +230,6 @@ impl Engine {
             }
         }
         ids.len()
-    }
-
-    fn watch(&self, ids: &[i64]) -> Vec<ScoreWait> {
-        ids.iter()
-            .copied()
-            .map(|id| self.waiting.reply(id))
-            .collect()
     }
 
     async fn wait_for(&self, waits: Vec<ScoreWait>) -> Result<(), AppError> {
@@ -308,13 +307,6 @@ fn context<'a>(prior: &'a [Message], batch: &'a [Message], index: usize) -> Vec<
             .filter(|message| &message.room_id == room),
     );
     window
-}
-
-fn validate_all(messages: &[IncomingMessage]) -> Result<(), AppError> {
-    for message in messages {
-        validate(message)?;
-    }
-    Ok(())
 }
 
 fn validate(message: &IncomingMessage) -> Result<(), AppError> {

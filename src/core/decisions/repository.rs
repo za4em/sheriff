@@ -4,7 +4,7 @@ use super::{CategoryScores, Decision, MessageWithContext, Status};
 use crate::core::category::Action;
 use crate::error::{AppError, database};
 
-pub(super) async fn insert_pending(
+pub(crate) async fn insert_pending(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     messages: &[MessageWithContext],

@@ -1,7 +1,7 @@
 use super::{IncomingMessage, Message};
 use crate::error::{AppError, database};
 
-pub(super) async fn insert(
+pub(crate) async fn insert(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     message: &IncomingMessage,

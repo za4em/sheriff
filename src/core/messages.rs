@@ -37,15 +37,7 @@ pub(crate) struct Messages {
     window: i64,
 }
 
-/// Inserts on the caller's transaction. The engine owns that transaction.
-pub(crate) async fn insert_on(
-    connection: &mut sqlx::PgConnection,
-    tenant: &str,
-    message: &IncomingMessage,
-    retained: bool,
-) -> Result<Message, AppError> {
-    repository::insert(connection, tenant, message, retained).await
-}
+pub(crate) use repository::insert;
 
 impl Messages {
     pub(crate) fn new(pool: PgPool, window: i64) -> Self {

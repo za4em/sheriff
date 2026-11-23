@@ -50,14 +50,7 @@ pub(crate) struct MessageWithContext {
     pub(crate) context: Vec<i64>,
 }
 
-/// Inserts on the caller's transaction. The engine owns that transaction.
-pub(crate) async fn insert_pending_on(
-    connection: &mut sqlx::PgConnection,
-    tenant: &str,
-    messages: &[MessageWithContext],
-) -> Result<Vec<i64>, AppError> {
-    repository::insert_pending(connection, tenant, messages).await
-}
+pub(crate) use repository::insert_pending;
 
 #[derive(Clone)]
 pub(crate) struct Decisions {
