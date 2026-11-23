@@ -13,18 +13,18 @@ use super::webhooks::Webhooks;
 use crate::error::{AppError, database, queue};
 use crate::metrics::Metrics;
 
+mod plan;
 mod sweep;
 mod wait;
 mod worker;
 
+use plan::{BatchConfig, plan_windows};
 use wait::{ScoreWait, WaitList, Waiter};
 
 pub(crate) type SocketSender = mpsc::UnboundedSender<Decision>;
 
 const SCORE_WAIT: Duration = Duration::from_secs(5);
 const QUEUE_DEPTH_EVERY: Duration = Duration::from_secs(5);
-
-type RoomWindows = BTreeMap<String, Vec<Message>>;
 
 #[derive(Clone)]
 pub(crate) struct Engine {
@@ -36,6 +36,7 @@ pub(crate) struct Engine {
     cache: Cache,
     waiting: WaitList,
     metrics: Metrics,
+    batch: BatchConfig,
 }
 
 impl Engine {
@@ -43,6 +44,7 @@ impl Engine {
         pool: PgPool,
         provider: Provider,
         window: i64,
+        overlap: i64,
         threshold: f64,
         queue: Queue,
         cache: Cache,
@@ -57,6 +59,10 @@ impl Engine {
             cache,
             waiting: WaitList::default(),
             metrics,
+            batch: BatchConfig {
+                window: window as usize,
+                overlap: overlap as usize,
+            },
         })
     }
 
@@ -146,29 +152,31 @@ impl Engine {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut waits: Vec<ScoreWait> = ids
+        let waits: Vec<ScoreWait> = ids
             .iter()
             .copied()
             .map(|id| self.waiting.reply(id))
             .collect();
         let published = self.enqueue(&ids).await;
-        waits.truncate(published);
-        self.wait_for(waits).await?;
-        let decisions = self.decisions.get_many(&ids).await;
-        if let Err(err) = self.decisions.delete(&ids).await {
-            tracing::error!(error = %err, "background work failed");
-        }
-        let decisions = decisions?;
-        if published != ids.len() {
+        if published == 0 {
+            drop(waits);
+            if let Err(err) = self.decisions.delete(&ids).await {
+                tracing::error!(error = %err, "background work failed");
+            }
             return Err(queue(
                 "publishing a score job",
                 "the broker did not accept the job",
             ));
         }
-        Ok(decisions)
+        self.wait_for(waits).await?;
+        let decisions = self.decisions.get_many(&ids).await;
+        if let Err(err) = self.decisions.delete(&ids).await {
+            tracing::error!(error = %err, "background work failed");
+        }
+        decisions
     }
 
-    /// Stores the batch as retained and publishes one job per decision. Returns before the worker finishes.
+    /// Stores the batch as retained and publishes one job for the group. Returns before the worker finishes.
     /// `reply`, when set, receives each decision as it is written.
     pub(crate) async fn submit(
         &self,
@@ -201,7 +209,7 @@ impl Engine {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
-        let windows = windows(&self.messages, tenant, messages).await?;
+        let priors = room_history(&self.messages, tenant, messages).await?;
         let mut tx = self
             .pool
             .begin()
@@ -211,25 +219,30 @@ impl Engine {
         for message in messages {
             stored.push(super::messages::insert(&mut tx, tenant, message, retained).await?);
         }
-        let ids =
-            super::decisions::insert_pending(&mut tx, tenant, &with_context(&windows, &stored))
-                .await?;
+        let (pending, windows) = planned(&priors, &stored, self.batch);
+        let group_id = uuid::Uuid::new_v4().to_string();
+        let ids = super::decisions::insert_pending(&mut tx, tenant, &group_id, &pending).await?;
+        super::decisions::insert_windows(&mut tx, &group_id, &windows).await?;
         tx.commit()
             .await
             .map_err(|err| database("saving a batch", err))?;
         Ok(ids)
     }
 
-    /// Publishes one job per decision. A job that does not reach the broker stays pending
-    /// for the sweeper. Returns how many leading jobs were published.
+    /// Publishes the group's job, keyed by the minimum decision id.
+    /// A job that does not reach the broker stays pending for the sweeper.
+    /// Returns 1 when the job was published and 0 when it was not.
     async fn enqueue(&self, ids: &[i64]) -> usize {
-        for (published, id) in ids.iter().copied().enumerate() {
-            if let Err(err) = self.queue.publish(&ScoreJob { decision_id: id }).await {
-                tracing::error!(error = %err, decision_id = id, "score job was not published");
-                return published;
+        let Some(decision_id) = ids.iter().copied().min() else {
+            return 0;
+        };
+        match self.queue.publish(&ScoreJob { decision_id }).await {
+            Ok(()) => 1,
+            Err(err) => {
+                tracing::error!(error = %err, decision_id, "score job was not published");
+                0
             }
         }
-        ids.len()
     }
 
     async fn wait_for(&self, waits: Vec<ScoreWait>) -> Result<(), AppError> {
@@ -261,52 +274,65 @@ fn watch_queue_depth(queue: Queue, metrics: Metrics) {
     });
 }
 
-async fn windows(
+async fn room_history(
     messages: &Messages,
     tenant: &str,
     batch: &[IncomingMessage],
-) -> Result<RoomWindows, AppError> {
-    let mut windows = RoomWindows::new();
+) -> Result<BTreeMap<String, Vec<Message>>, AppError> {
+    let mut priors = BTreeMap::new();
     for message in batch {
-        if windows.contains_key(&message.room_id) {
+        if priors.contains_key(&message.room_id) {
             continue;
         }
-        let window = messages.room(tenant, &message.room_id).await?;
-        windows.insert(message.room_id.clone(), window);
+        let history = messages.room(tenant, &message.room_id).await?;
+        priors.insert(message.room_id.clone(), history);
     }
-    Ok(windows)
+    Ok(priors)
 }
 
-fn with_context(windows: &RoomWindows, messages: &[Message]) -> Vec<MessageWithContext> {
-    messages
+fn planned(
+    priors: &BTreeMap<String, Vec<Message>>,
+    stored: &[Message],
+    config: BatchConfig,
+) -> (Vec<MessageWithContext>, Vec<Vec<i64>>) {
+    let mut windows = Vec::new();
+    let mut first = BTreeMap::<i64, Vec<i64>>::new();
+    for (room, incoming) in incoming_by_room(stored) {
+        let prior = priors.get(&room).map(Vec::as_slice).unwrap_or(&[]);
+        for window in plan_windows(prior, &incoming, config) {
+            let ids = window
+                .iter()
+                .map(|message| message.row_id)
+                .collect::<Vec<_>>();
+            for id in &ids {
+                first.entry(*id).or_insert_with(|| ids.clone());
+            }
+            windows.push(ids);
+        }
+    }
+    let pending = stored
         .iter()
-        .enumerate()
-        .map(|(index, message)| MessageWithContext {
+        .map(|message| MessageWithContext {
             message_row_id: message.row_id,
-            context: context(
-                windows
-                    .get(&message.room_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                messages,
-                index,
-            )
-            .into_iter()
-            .map(|line| line.row_id)
-            .collect(),
+            context: first
+                .get(&message.row_id)
+                .expect("incoming message is in a window")
+                .clone(),
         })
-        .collect()
+        .collect();
+    (pending, windows)
 }
 
-fn context<'a>(prior: &'a [Message], batch: &'a [Message], index: usize) -> Vec<&'a Message> {
-    let room = &batch[index].room_id;
-    let mut window: Vec<&Message> = prior.iter().collect();
-    window.extend(
-        batch[..=index]
-            .iter()
-            .filter(|message| &message.room_id == room),
-    );
-    window
+fn incoming_by_room(stored: &[Message]) -> Vec<(String, Vec<Message>)> {
+    let mut rooms: Vec<(String, Vec<Message>)> = Vec::new();
+    for message in stored {
+        if let Some((_, messages)) = rooms.iter_mut().find(|(room, _)| room == &message.room_id) {
+            messages.push(message.clone());
+        } else {
+            rooms.push((message.room_id.clone(), vec![message.clone()]));
+        }
+    }
+    rooms
 }
 
 fn validate(message: &IncomingMessage) -> Result<(), AppError> {
@@ -375,60 +401,6 @@ mod tests {
         assert_eq!(
             worker::lines(&messages.iter().collect::<Vec<_>>(), 2),
             "u1: you're an idiot\n[this] u2: hello\nu3: ok"
-        );
-    }
-
-    #[test]
-    fn the_batch_is_applied_onto_the_room_in_order() {
-        let prior = vec![message(10, "r", "u0", "earlier")];
-        let batch = vec![
-            message(1, "r", "u1", "you're an idiot"),
-            message(2, "r", "u2", "hello"),
-            message(3, "other", "u1", "ok"),
-            message(4, "r", "u1", "idiot"),
-        ];
-        assert_eq!(
-            worker::lines(&context(&prior, &batch, 0), 1),
-            "u0: earlier\n[this] u1: you're an idiot"
-        );
-        assert_eq!(
-            worker::lines(&context(&prior, &batch, 1), 2),
-            "u0: earlier\nu1: you're an idiot\n[this] u2: hello"
-        );
-        assert_eq!(worker::lines(&context(&[], &batch, 2), 3), "[this] u1: ok");
-        let fourth = context(&prior, &batch, 3);
-        assert!(fourth.iter().any(|message| message.row_id == 1));
-        assert!(fourth.iter().any(|message| message.row_id == 2));
-        assert!(fourth.iter().all(|message| message.room_id == "r"));
-    }
-
-    #[test]
-    fn a_repeated_client_id_is_another_message() {
-        let prior = vec![message(1, "r", "u1", "old")];
-        let batch = vec![
-            message(2, "r", "u1", "first"),
-            message(3, "r", "u1", "second"),
-        ];
-        let window = context(&prior, &batch, 1);
-        assert_eq!(
-            window
-                .iter()
-                .map(|message| message.text.as_str())
-                .collect::<Vec<_>>(),
-            ["old", "first", "second"]
-        );
-    }
-
-    #[test]
-    fn the_batch_is_appended_in_request_order() {
-        let prior = vec![message(10, "r", "u0", "stored")];
-        let batch = vec![
-            message(1, "r", "u1", "first"),
-            message(2, "r", "u2", "second"),
-        ];
-        assert_eq!(
-            worker::lines(&context(&prior, &batch, 1), 2),
-            "u0: stored\nu1: first\n[this] u2: second"
         );
     }
 }

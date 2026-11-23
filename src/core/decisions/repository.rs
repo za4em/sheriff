@@ -7,14 +7,15 @@ use crate::error::{AppError, database};
 pub(crate) async fn insert_pending(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
+    group_id: &str,
     messages: &[MessageWithContext],
 ) -> Result<Vec<i64>, AppError> {
     let mut ids = Vec::with_capacity(messages.len());
     for message in messages {
         let id: i64 = sqlx::query_scalar(
             r#"
-            INSERT INTO decisions (tenant_id, message_id, status, context)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO decisions (tenant_id, message_id, status, context, group_id)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             "#,
         )
@@ -22,6 +23,7 @@ pub(crate) async fn insert_pending(
         .bind(message.message_row_id)
         .bind(Status::Pending)
         .bind(&message.context)
+        .bind(group_id)
         .fetch_one(&mut *connection)
         .await
         .map_err(|err| database("opening a decision", err))?;
@@ -30,11 +32,34 @@ pub(crate) async fn insert_pending(
     Ok(ids)
 }
 
+pub(crate) async fn insert_windows(
+    connection: &mut sqlx::PgConnection,
+    group_id: &str,
+    windows: &[Vec<i64>],
+) -> Result<(), AppError> {
+    for (position, message_ids) in windows.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO score_windows (group_id, position, message_ids)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(group_id)
+        .bind(position as i32)
+        .bind(message_ids)
+        .execute(&mut *connection)
+        .await
+        .map_err(|err| database("saving a score window", err))?;
+    }
+    Ok(())
+}
+
 pub(super) async fn mark_ready(
     pool: &PgPool,
     decision_id: i64,
     chosen: Action,
     categories: &CategoryScores,
+    context: Option<&[i64]>,
 ) -> Result<bool, AppError> {
     let mut tx = pool
         .begin()
@@ -60,6 +85,20 @@ pub(super) async fn mark_ready(
     .map_err(|err| database("saving a decision (update)", err))?;
     if saved.rows_affected() == 0 {
         return Ok(false);
+    }
+    if let Some(context) = context {
+        sqlx::query(
+            r#"
+            UPDATE decisions
+            SET context = $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(decision_id)
+        .bind(context)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| database("saving a decision (update)", err))?;
     }
     insert_scores(&mut tx, decision_id, categories).await?;
     tx.commit()
@@ -109,6 +148,7 @@ pub(super) async fn list(
     sqlx::query_as(
         r#"
         SELECT d.id,
+               d.group_id,
                m.tenant_id,
                d.message_id,
                m.client_message_id,
@@ -166,6 +206,7 @@ pub(super) async fn get(pool: &PgPool, ids: &[i64]) -> Result<Vec<Decision>, App
     sqlx::query_as(
         r#"
         SELECT d.id,
+               d.group_id,
                d.tenant_id,
                d.message_id,
                m.client_message_id,
@@ -191,6 +232,51 @@ pub(super) async fn get(pool: &PgPool, ids: &[i64]) -> Result<Vec<Decision>, App
     .map_err(|err| database("reading decisions", err))
 }
 
+pub(super) async fn group(pool: &PgPool, group_id: &str) -> Result<Vec<Decision>, AppError> {
+    sqlx::query_as(
+        r#"
+        SELECT d.id,
+               d.group_id,
+               d.tenant_id,
+               d.message_id,
+               m.client_message_id,
+               d.status,
+               d.action,
+               scores.categories,
+               d.error,
+               d.context
+        FROM decisions d
+        JOIN messages m ON m.id = d.message_id
+        LEFT JOIN LATERAL (
+            SELECT jsonb_object_agg(category, score) AS categories
+            FROM decision_scores
+            WHERE decision_id = d.id
+        ) scores ON true
+        WHERE d.group_id = $1
+        ORDER BY d.id
+        "#,
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| database("reading decisions", err))
+}
+
+pub(super) async fn windows(pool: &PgPool, group_id: &str) -> Result<Vec<Vec<i64>>, AppError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT message_ids
+        FROM score_windows
+        WHERE group_id = $1
+        ORDER BY position
+        "#,
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| database("reading score windows", err))
+}
+
 pub(super) async fn stale_pending(
     pool: &PgPool,
     seconds: i64,
@@ -198,11 +284,12 @@ pub(super) async fn stale_pending(
 ) -> Result<Vec<i64>, AppError> {
     sqlx::query_scalar(
         r#"
-        SELECT id
+        SELECT MIN(id)
         FROM decisions
         WHERE status = $1
           AND updated_at < now() - make_interval(secs => $2)
-        ORDER BY updated_at ASC
+        GROUP BY group_id
+        ORDER BY MIN(updated_at)
         LIMIT $3
         "#,
     )
@@ -221,7 +308,7 @@ pub(super) async fn delete(pool: &PgPool, ids: &[i64]) -> Result<(), AppError> {
     sqlx::query(
         r#"
         WITH doomed AS (
-            SELECT id, message_id, context
+            SELECT id, message_id, context, group_id
             FROM decisions
             WHERE id = ANY($1)
         ),
@@ -229,6 +316,16 @@ pub(super) async fn delete(pool: &PgPool, ids: &[i64]) -> Result<(), AppError> {
             SELECT message_id AS id FROM doomed
             UNION
             SELECT unnest(context) FROM doomed
+        ),
+        drop_windows AS (
+            DELETE FROM score_windows AS w
+            WHERE w.group_id IN (SELECT group_id FROM doomed)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM decisions d
+                  WHERE d.group_id = w.group_id
+                    AND d.id <> ALL($1)
+              )
         ),
         drop_decisions AS (
             DELETE FROM decisions

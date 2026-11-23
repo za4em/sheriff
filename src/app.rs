@@ -30,6 +30,7 @@ impl App {
             pool,
             provider,
             config.window,
+            config.overlap,
             config.threshold,
             queue,
             cache,

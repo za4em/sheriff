@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{DecisionProvider, Fault, Probabilities, Questions};
@@ -20,21 +21,12 @@ impl DecisionProvider for Mock {
         if !self.latency.is_zero() {
             tokio::time::sleep(self.latency).await;
         }
-        let insult = if judged_has_word(state, "idiot") {
-            INSULT_SCORE
-        } else {
-            0.0
-        };
-        let bullying = if author_repeats_word(state, "idiot") {
-            INSULT_SCORE
-        } else {
-            0.0
-        };
-        let grooming = if judged_has_word(state, "secret") && author_has_other_line(state) {
-            INSULT_SCORE
-        } else {
-            0.0
-        };
+        let (insult, bullying, grooming) =
+            if state.lines().any(|line| line.starts_with(super::JUDGED)) {
+                judged_scores(state)
+            } else {
+                batch_scores(state)
+            };
         Ok(questions
             .keys()
             .map(|key| {
@@ -48,6 +40,56 @@ impl DecisionProvider for Mock {
             })
             .collect())
     }
+}
+
+fn judged_scores(state: &str) -> (f64, f64, f64) {
+    let insult = if judged_has_word(state, "idiot") {
+        INSULT_SCORE
+    } else {
+        0.0
+    };
+    let bullying = if author_repeats_word(state, "idiot") {
+        INSULT_SCORE
+    } else {
+        0.0
+    };
+    let grooming = if judged_has_word(state, "secret") && author_has_other_line(state) {
+        INSULT_SCORE
+    } else {
+        0.0
+    };
+    (insult, bullying, grooming)
+}
+
+fn batch_scores(state: &str) -> (f64, f64, f64) {
+    let mut lines_by_author: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for line in state.lines() {
+        if let Some(author) = line_author(line) {
+            lines_by_author.entry(author).or_default().push(line);
+        }
+    }
+    let insult = if state.lines().any(|line| has_word(line, "idiot")) {
+        INSULT_SCORE
+    } else {
+        0.0
+    };
+    let bullying = if lines_by_author
+        .values()
+        .any(|lines| lines.iter().filter(|line| has_word(line, "idiot")).count() >= 2)
+    {
+        INSULT_SCORE
+    } else {
+        0.0
+    };
+    let grooming = if lines_by_author
+        .values()
+        .any(|lines| lines.len() >= 2 && lines.iter().any(|line| has_word(line, "secret")))
+    {
+        INSULT_SCORE
+    } else {
+        0.0
+    };
+    (insult, bullying, grooming)
 }
 
 fn author_has_other_line(state: &str) -> bool {
@@ -149,5 +191,35 @@ mod tests {
         assert_eq!(scores["insult"], 0.0);
         assert_eq!(scores["bullying"], 0.0);
         assert_eq!(scores["grooming"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_insult_is_not_bullying() {
+        let scores = Mock::new(Duration::ZERO)
+            .decide("u: you idiot", &questions())
+            .await
+            .unwrap();
+        assert_eq!(scores["insult"], INSULT_SCORE);
+        assert_eq!(scores["bullying"], 0.0);
+        assert_eq!(scores["grooming"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn two_idiot_lines_from_one_author_are_bullying() {
+        let scores = Mock::new(Duration::ZERO)
+            .decide("u: idiot\nu: idiot", &questions())
+            .await
+            .unwrap();
+        assert_eq!(scores["bullying"], INSULT_SCORE);
+        assert_eq!(scores["insult"], INSULT_SCORE);
+    }
+
+    #[tokio::test]
+    async fn a_clean_batch_scores_insult_at_zero() {
+        let scores = Mock::new(Duration::ZERO)
+            .decide("u: hello", &questions())
+            .await
+            .unwrap();
+        assert_eq!(scores["insult"], 0.0);
     }
 }

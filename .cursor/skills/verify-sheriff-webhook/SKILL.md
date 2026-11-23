@@ -37,8 +37,8 @@ A passing run prints two lines: the claim holds for the faithful model, and the 
 
 Each action is one await in the Rust, not a whole request.
 
-- `ReadPending` is `decisions.get` in `worker.rs` `run` while `status` is `Pending`.
-- `ReadDone` is that same get after another worker has already left `Pending`. The worker will publish `completed_now` false.
+- `ReadPending` is the group load in `worker.rs` `run` while this decision's `status` is `Pending`.
+- `ReadDone` is that load after this decision has left `Pending`. The worker publishes `completed_now` false.
 - `MarkReady` is `mark_ready`: `UPDATE decisions SET status = ready WHERE id = $1 AND status = pending`. At most one worker gets `true`.
 - `Publish` is `cache.ready_decision`, an `XADD` on `sheriff.ready`.
 - `Observe` is one instance reading the next stream entry. Every instance has its own cursor. This is not a Redis consumer group.
