@@ -14,7 +14,18 @@ pub(super) fn plan_windows<'a>(
     if incoming.is_empty() {
         return Vec::new();
     }
-    let stride = config.window - config.overlap;
+    let sequence = window_sequence(prior, incoming, config);
+    if sequence.len() <= config.window {
+        return vec![sequence];
+    }
+    slide_windows(sequence, config)
+}
+
+fn window_sequence<'a>(
+    prior: &'a [Message],
+    incoming: &'a [Message],
+    config: BatchConfig,
+) -> Vec<&'a Message> {
     let prefix = if incoming.len() >= config.window {
         config.overlap
     } else {
@@ -23,27 +34,36 @@ pub(super) fn plan_windows<'a>(
     let prefix = prefix.min(prior.len());
     let mut sequence: Vec<&Message> = prior[prior.len() - prefix..].iter().collect();
     sequence.extend(incoming);
-    if sequence.len() <= config.window {
-        return vec![sequence];
-    }
+    sequence
+}
+
+fn slide_windows<'a>(sequence: Vec<&'a Message>, config: BatchConfig) -> Vec<Vec<&'a Message>> {
+    let stride = config.window - config.overlap;
     let mut windows = Vec::new();
     let mut start = 0;
     loop {
         let end = start + config.window;
         windows.push(sequence[start..end].to_vec());
-        if end == sequence.len() {
+        let Some(next) = next_start(start, end, sequence.len(), stride, config.window) else {
             break;
-        }
-        let mut next = start + stride;
-        if next + config.window > sequence.len() {
-            next = sequence.len() - config.window;
-        }
-        if next <= start {
-            break;
-        }
+        };
         start = next;
     }
     windows
+}
+
+fn next_start(start: usize, end: usize, len: usize, stride: usize, window: usize) -> Option<usize> {
+    if end == len {
+        return None;
+    }
+    let mut next = start + stride;
+    if next + window > len {
+        next = len - window;
+    }
+    if next <= start {
+        return None;
+    }
+    Some(next)
 }
 
 #[cfg(test)]

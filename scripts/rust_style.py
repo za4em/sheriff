@@ -3,9 +3,10 @@
 
 Import a type instead of writing a path of two or more '::'. The last
 segment of that path is the type, or the segment before it when the last
-segment is an enum variant. assert! belongs in a test. A function that
-contains two of if, match, and for/while/loop and runs past 48 lines does
-not fit on one screen. run, screen, and Screen do not say what happens.
+segment is an enum variant. assert! belongs in a test. A function may
+contain if, match, and for. It fails when one of those sits inside another
+and the function runs past 30 lines. run, screen, and Screen do not say
+what happens.
 """
 
 import pathlib
@@ -14,7 +15,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-SCREEN_LINES = 48
+SCREEN_LINES = 30
+CONTROL = {"if", "for", "while", "loop", "match"}
 BANNED_FUNCTIONS = {
     "run": "score_group scores one group, watch_pending republishes stale decisions",
     "screen": "judge_window asks the provider, classify_windows walks the windows",
@@ -23,7 +25,6 @@ BANNED_TYPES = {"Screen": "WindowVerdict"}
 TYPE_PATH = re.compile(
     r"\b(?:[A-Za-z_][A-Za-z0-9_]*::){2,}[A-Z][A-Za-z0-9_]*\b"
 )
-KIND = {"if": "if", "match": "match", "for": "for", "while": "for", "loop": "for"}
 
 
 def at_string(text, i):
@@ -197,11 +198,29 @@ def imported_type(path):
     return parts[-1]
 
 
-def control_kinds(body):
-    found = set()
-    for match in re.finditer(r"\b(if|for|while|loop|match)\b", body):
-        found.add(KIND[match.group(1)])
-    return found
+def control_depth(body):
+    """How deep if, match, for, while, or loop sit inside each other."""
+    depth = 0
+    deepest = 0
+    stack = []
+    pending = False
+    for match in re.finditer(r"\b(if|for|while|loop|match)\b|[{}]", body):
+        token = match.group(0)
+        if token in CONTROL:
+            pending = True
+            continue
+        if token == "{":
+            kind = "control" if pending else "other"
+            pending = False
+            stack.append(kind)
+            if kind == "control":
+                depth += 1
+                deepest = max(deepest, depth)
+            continue
+        pending = False
+        if stack and stack.pop() == "control":
+            depth -= 1
+    return deepest
 
 
 def type_names(text):
@@ -239,11 +258,10 @@ def check_text(path, text):
                 f"{path}:{line_of(text, start)}: rename {name}. {BANNED_FUNCTIONS[name]}"
             )
         span = line_of(text, end - 1) - line_of(text, start) + 1
-        kinds = control_kinds(clean[brace:end])
-        if span > SCREEN_LINES and len(kinds) >= 2:
-            listed = ", ".join(sorted(kinds))
+        depth = control_depth(clean[brace:end])
+        if depth >= 2 and span > SCREEN_LINES:
             failures.append(
-                f"{path}:{line_of(text, start)}: {name} is {span} lines and nests {listed}. Split it so it fits on one screen ({SCREEN_LINES} lines)"
+                f"{path}:{line_of(text, start)}: {name} is {span} lines and nests control flow {depth} deep. Split it so the nesting is inside {SCREEN_LINES} lines"
             )
     for name, start in type_names(clean):
         if in_ranges(start, tests):
@@ -255,9 +273,16 @@ def check_text(path, text):
     return failures
 
 
-def long_branchy(name):
-    lines = [f"fn {name}() {{", "    if true {", "        let _ = 1;", "    }"]
-    lines.extend(["    let _ = 1;"] * 45)
+def nested_long():
+    lines = ["fn keep() {", "    for _ in 0..1 {"]
+    lines.extend(["        let _ = 1;"] * 28)
+    lines.extend(["        if true {", "            let _ = 1;", "        }", "    }", "}"])
+    return "\n".join(lines) + "\n"
+
+
+def sibling_controls():
+    lines = ["fn keep() {", "    if true {", "        let _ = 1;", "    }"]
+    lines.extend(["    let _ = 1;"] * 28)
     lines.extend(["    for _ in 0..1 {", "        let _ = 1;", "    }", "}"])
     return "\n".join(lines) + "\n"
 
@@ -270,7 +295,7 @@ BAD = {
     "production assert": ("fn keep() {\n    assert!(true);\n}\n", "assert belongs in a test"),
     "vague function": ("fn screen() {}\nfn run() {}\n", "rename screen"),
     "vague type": ("enum Screen { Hit }\n", "rename Screen to WindowVerdict"),
-    "long function": (long_branchy("keep"), "fits on one screen"),
+    "nested function": (nested_long(), "nests control flow"),
 }
 
 GOOD = (
@@ -299,6 +324,7 @@ mod tests {
     + "fn name() {\n"
     + "    match 1 {\n        1 => {}\n        _ => {}\n    }\n" * 20
     + "}\n"
+    + sibling_controls()
 )
 
 

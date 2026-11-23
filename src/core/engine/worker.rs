@@ -63,6 +63,13 @@ fn open_rows(group: Vec<Decision>) -> Vec<Open> {
         .collect()
 }
 
+async fn publish_saved(cache: &Cache, group: &[Decision]) -> Result<(), AppError> {
+    for decision in group {
+        cache.ready_decision(decision.id, false).await?;
+    }
+    Ok(())
+}
+
 async fn score_group(
     job: &ScoreJob,
     decisions: &Decisions,
@@ -78,10 +85,7 @@ async fn score_group(
         .iter()
         .all(|decision| decision.status != Status::Pending)
     {
-        for decision in &group {
-            cache.ready_decision(decision.id, false).await?;
-        }
-        return Ok(());
+        return publish_saved(cache, &group).await;
     }
     let mut open = open_rows(group);
     let windows = decisions.windows(&seed.group_id).await?;
@@ -95,7 +99,11 @@ async fn score_group(
     )
     .await?;
     finish(decisions, cache, &mut open, &hits).await?;
-    for row in &mut open {
+    publish_rest(cache, &mut open).await
+}
+
+async fn publish_rest(cache: &Cache, open: &mut [Open]) -> Result<(), AppError> {
+    for row in open {
         if !row.published {
             tell(cache, row).await?;
         }
@@ -202,29 +210,35 @@ async fn finish(
         if !row.pending {
             continue;
         }
-        if let Some(index) = row.first_hit {
-            let refs: Vec<&Message> = hits[index].iter().collect();
-            let state = lines(&refs, row.message_row_id);
-            row.completed_now = match decisions.score(&state).await {
-                Ok((action, categories)) => {
-                    decisions.mark_ready(row.id, action, &categories).await?
-                }
-                Err(err @ AppError::Provider(_)) => {
-                    decisions.mark_failed(row.id, &err.to_string()).await?
-                }
-                Err(err) => return Err(err),
-            };
-        } else if let Some(failure) = row.failure.clone() {
-            row.completed_now = decisions.mark_failed(row.id, &failure).await?;
-        } else {
-            row.completed_now = decisions
-                .mark_ready(row.id, Action::Allow, &zero_scores())
-                .await?;
-        }
+        row.completed_now = settle(decisions, hits, row).await?;
         row.pending = false;
         tell(cache, row).await?;
     }
     Ok(())
+}
+
+async fn settle(
+    decisions: &Decisions,
+    hits: &[Vec<Message>],
+    row: &Open,
+) -> Result<bool, AppError> {
+    if let Some(index) = row.first_hit {
+        let refs: Vec<&Message> = hits[index].iter().collect();
+        let state = lines(&refs, row.message_row_id);
+        return match decisions.score(&state).await {
+            Ok((action, categories)) => decisions.mark_ready(row.id, action, &categories).await,
+            Err(err @ AppError::Provider(_)) => {
+                decisions.mark_failed(row.id, &err.to_string()).await
+            }
+            Err(err) => Err(err),
+        };
+    }
+    if let Some(failure) = row.failure.clone() {
+        return decisions.mark_failed(row.id, &failure).await;
+    }
+    decisions
+        .mark_ready(row.id, Action::Allow, &zero_scores())
+        .await
 }
 
 fn zero_scores() -> CategoryScores {

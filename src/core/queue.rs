@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures_lite::StreamExt;
+use lapin::message::Delivery;
 use lapin::{
     BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
     options::{
@@ -209,30 +210,42 @@ async fn dispatch(queue: Queue, prefetch: u16, tx: mpsc::Sender<JobDelivery>) {
                 continue;
             }
         };
-        loop {
-            match consumer.next().await {
-                Some(Ok(delivery)) => match serde_json::from_slice(&delivery.data) {
-                    Ok(job) => {
-                        if tx.send(JobDelivery::new(job, delivery)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(error = %err, "score job could not be read");
-                        let _ = delivery.ack(BasicAckOptions::default()).await;
-                    }
-                },
-                Some(Err(err)) => {
-                    tracing::error!(error = %err, "score consumer failed");
-                    break;
-                }
-                None => {
-                    tracing::error!("score consumer ended");
-                    break;
-                }
-            }
+        if !accept_deliveries(&mut consumer, &tx).await {
+            return;
         }
         tokio::time::sleep(REQUEUE_PAUSE).await;
+    }
+}
+
+async fn accept_deliveries(consumer: &mut Consumer, tx: &mpsc::Sender<JobDelivery>) -> bool {
+    loop {
+        match consumer.next().await {
+            Some(Ok(delivery)) => {
+                if !accept_job(tx, delivery).await {
+                    return false;
+                }
+            }
+            Some(Err(err)) => {
+                tracing::error!(error = %err, "score consumer failed");
+                break;
+            }
+            None => {
+                tracing::error!("score consumer ended");
+                break;
+            }
+        }
+    }
+    true
+}
+
+async fn accept_job(tx: &mpsc::Sender<JobDelivery>, delivery: Delivery) -> bool {
+    match serde_json::from_slice(&delivery.data) {
+        Ok(job) => tx.send(JobDelivery::new(job, delivery)).await.is_ok(),
+        Err(err) => {
+            tracing::error!(error = %err, "score job could not be read");
+            let _ = delivery.ack(BasicAckOptions::default()).await;
+            true
+        }
     }
 }
 

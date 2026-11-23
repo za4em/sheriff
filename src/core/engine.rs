@@ -97,23 +97,11 @@ impl Engine {
                 Ok(decision) => decision,
                 Err(err) => {
                     tracing::error!(error = %err, "background work failed");
-                    if let Some(Waiter::Reply(done)) = waiter {
-                        let _ = done.send(());
-                    }
+                    release_reply(waiter);
                     continue;
                 }
             };
-            match waiter {
-                Some(Waiter::Reply(done)) => {
-                    let _ = done.send(());
-                }
-                Some(Waiter::Socket(socket)) => {
-                    if let Some(decision) = decision.clone() {
-                        let _ = socket.send(decision);
-                    }
-                }
-                None => {}
-            }
+            deliver(waiter, decision.clone());
             if finished.completed_now
                 && let Some(decision) = decision
                 && self.claim_webhook(finished.decision_id).await
@@ -160,14 +148,7 @@ impl Engine {
             .collect();
         let published = self.enqueue(&ids).await;
         if published == 0 {
-            drop(waits);
-            if let Err(err) = self.decisions.delete(&ids).await {
-                tracing::error!(error = %err, "background work failed");
-            }
-            return Err(queue(
-                "publishing a score job",
-                "the broker did not accept the job",
-            ));
+            return self.abandon(&ids, waits).await;
         }
         self.wait_for(waits).await?;
         let decisions = self.decisions.get_many(&ids).await;
@@ -175,6 +156,17 @@ impl Engine {
             tracing::error!(error = %err, "background work failed");
         }
         decisions
+    }
+
+    async fn abandon(&self, ids: &[i64], waits: Vec<ScoreWait>) -> Result<Vec<Decision>, AppError> {
+        drop(waits);
+        if let Err(err) = self.decisions.delete(ids).await {
+            tracing::error!(error = %err, "background work failed");
+        }
+        Err(queue(
+            "publishing a score job",
+            "the broker did not accept the job",
+        ))
     }
 
     /// Stores the batch as retained and publishes one job for the group. Returns before the worker finishes.
@@ -260,6 +252,26 @@ impl Engine {
             Ok(result) => result,
             Err(_) => Err(AppError::ScoreTimeout),
         }
+    }
+}
+
+fn release_reply(waiter: Option<Waiter>) {
+    if let Some(Waiter::Reply(done)) = waiter {
+        let _ = done.send(());
+    }
+}
+
+fn deliver(waiter: Option<Waiter>, decision: Option<Decision>) {
+    match waiter {
+        Some(Waiter::Reply(done)) => {
+            let _ = done.send(());
+        }
+        Some(Waiter::Socket(socket)) => {
+            if let Some(decision) = decision {
+                let _ = socket.send(decision);
+            }
+        }
+        None => {}
     }
 }
 
