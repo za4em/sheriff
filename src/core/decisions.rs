@@ -48,13 +48,6 @@ pub(crate) struct Decision {
     #[sqlx(json(nullable))]
     pub(crate) categories: Option<CategoryScores>,
     pub(crate) error: Option<String>,
-    #[serde(skip_serializing)]
-    pub(crate) context: Vec<i64>,
-}
-
-pub(crate) struct MessageWithContext {
-    pub(crate) message_row_id: i64,
-    pub(crate) context: Vec<i64>,
 }
 
 pub(crate) use repository::{insert_pending, insert_windows};
@@ -127,10 +120,8 @@ impl Decisions {
         decision_id: i64,
         action: Action,
         categories: &CategoryScores,
-        context: Option<&[i64]>,
     ) -> Result<bool, AppError> {
-        let saved =
-            repository::mark_ready(&self.pool, decision_id, action, categories, context).await?;
+        let saved = repository::mark_ready(&self.pool, decision_id, action, categories).await?;
         if saved {
             self.metrics.decision(action.name());
         }

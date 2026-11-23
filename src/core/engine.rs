@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 
 use super::cache::{Cache, ReadyDecision};
-use super::decisions::{Decision, Decisions, MessageWithContext};
+use super::decisions::{Decision, Decisions};
 use super::messages::{IncomingMessage, Message, Messages};
 use super::provider::Provider;
 use super::queue::{Queue, ScoreJob};
@@ -219,9 +219,10 @@ impl Engine {
         for message in messages {
             stored.push(super::messages::insert(&mut tx, tenant, message, retained).await?);
         }
-        let (pending, windows) = planned(&priors, &stored, self.batch);
+        let windows = planned(&priors, &stored, self.batch);
         let group_id = uuid::Uuid::new_v4().to_string();
-        let ids = super::decisions::insert_pending(&mut tx, tenant, &group_id, &pending).await?;
+        let row_ids: Vec<i64> = stored.iter().map(|message| message.row_id).collect();
+        let ids = super::decisions::insert_pending(&mut tx, tenant, &group_id, &row_ids).await?;
         super::decisions::insert_windows(&mut tx, &group_id, &windows).await?;
         tx.commit()
             .await
@@ -294,33 +295,27 @@ fn planned(
     priors: &BTreeMap<String, Vec<Message>>,
     stored: &[Message],
     config: BatchConfig,
-) -> (Vec<MessageWithContext>, Vec<Vec<i64>>) {
+) -> Vec<Vec<i64>> {
     let mut windows = Vec::new();
-    let mut first = BTreeMap::<i64, Vec<i64>>::new();
     for (room, incoming) in incoming_by_room(stored) {
         let prior = priors.get(&room).map(Vec::as_slice).unwrap_or(&[]);
         for window in plan_windows(prior, &incoming, config) {
-            let ids = window
-                .iter()
-                .map(|message| message.row_id)
-                .collect::<Vec<_>>();
-            for id in &ids {
-                first.entry(*id).or_insert_with(|| ids.clone());
-            }
-            windows.push(ids);
+            windows.push(
+                window
+                    .iter()
+                    .map(|message| message.row_id)
+                    .collect::<Vec<_>>(),
+            );
         }
     }
-    let pending = stored
-        .iter()
-        .map(|message| MessageWithContext {
-            message_row_id: message.row_id,
-            context: first
-                .get(&message.row_id)
-                .expect("incoming message is in a window")
-                .clone(),
-        })
-        .collect();
-    (pending, windows)
+    let covered: std::collections::BTreeSet<i64> = windows.iter().flatten().copied().collect();
+    assert!(
+        stored
+            .iter()
+            .all(|message| covered.contains(&message.row_id)),
+        "incoming message is in a window"
+    );
+    windows
 }
 
 fn incoming_by_room(stored: &[Message]) -> Vec<(String, Vec<Message>)> {

@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use super::{CategoryScores, Decision, MessageWithContext, Status};
+use super::{CategoryScores, Decision, Status};
 use crate::core::category::Action;
 use crate::error::{AppError, database};
 
@@ -8,21 +8,20 @@ pub(crate) async fn insert_pending(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     group_id: &str,
-    messages: &[MessageWithContext],
+    message_row_ids: &[i64],
 ) -> Result<Vec<i64>, AppError> {
-    let mut ids = Vec::with_capacity(messages.len());
-    for message in messages {
+    let mut ids = Vec::with_capacity(message_row_ids.len());
+    for message_row_id in message_row_ids {
         let id: i64 = sqlx::query_scalar(
             r#"
-            INSERT INTO decisions (tenant_id, message_id, status, context, group_id)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO decisions (tenant_id, message_id, status, group_id)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             "#,
         )
         .bind(tenant)
-        .bind(message.message_row_id)
+        .bind(message_row_id)
         .bind(Status::Pending)
-        .bind(&message.context)
         .bind(group_id)
         .fetch_one(&mut *connection)
         .await
@@ -59,7 +58,6 @@ pub(super) async fn mark_ready(
     decision_id: i64,
     chosen: Action,
     categories: &CategoryScores,
-    context: Option<&[i64]>,
 ) -> Result<bool, AppError> {
     let mut tx = pool
         .begin()
@@ -85,20 +83,6 @@ pub(super) async fn mark_ready(
     .map_err(|err| database("saving a decision (update)", err))?;
     if saved.rows_affected() == 0 {
         return Ok(false);
-    }
-    if let Some(context) = context {
-        sqlx::query(
-            r#"
-            UPDATE decisions
-            SET context = $2
-            WHERE id = $1
-            "#,
-        )
-        .bind(decision_id)
-        .bind(context)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| database("saving a decision (update)", err))?;
     }
     insert_scores(&mut tx, decision_id, categories).await?;
     tx.commit()
@@ -155,8 +139,7 @@ pub(super) async fn list(
                d.status,
                d.action,
                scores.categories,
-               d.error,
-               d.context
+               d.error
         FROM messages m
         JOIN decisions d ON d.message_id = m.id
         LEFT JOIN LATERAL (
@@ -213,8 +196,7 @@ pub(super) async fn get(pool: &PgPool, ids: &[i64]) -> Result<Vec<Decision>, App
                d.status,
                d.action,
                scores.categories,
-               d.error,
-               d.context
+               d.error
         FROM unnest($1::bigint[]) WITH ORDINALITY AS wanted(id, ord)
         JOIN decisions d ON d.id = wanted.id
         JOIN messages m ON m.id = d.message_id
@@ -243,8 +225,7 @@ pub(super) async fn group(pool: &PgPool, group_id: &str) -> Result<Vec<Decision>
                d.status,
                d.action,
                scores.categories,
-               d.error,
-               d.context
+               d.error
         FROM decisions d
         JOIN messages m ON m.id = d.message_id
         LEFT JOIN LATERAL (
@@ -308,14 +289,16 @@ pub(super) async fn delete(pool: &PgPool, ids: &[i64]) -> Result<(), AppError> {
     sqlx::query(
         r#"
         WITH doomed AS (
-            SELECT id, message_id, context, group_id
+            SELECT id, message_id, group_id
             FROM decisions
             WHERE id = ANY($1)
         ),
         refs AS (
             SELECT message_id AS id FROM doomed
             UNION
-            SELECT unnest(context) FROM doomed
+            SELECT unnest(w.message_ids)
+            FROM score_windows w
+            WHERE w.group_id IN (SELECT group_id FROM doomed)
         ),
         drop_windows AS (
             DELETE FROM score_windows AS w
@@ -339,7 +322,14 @@ pub(super) async fn delete(pool: &PgPool, ids: &[i64]) -> Result<(), AppError> {
               SELECT 1
               FROM decisions d
               WHERE d.id <> ALL($1)
-                AND (d.message_id = m.id OR m.id = ANY(d.context))
+                AND d.message_id = m.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM score_windows w
+              JOIN decisions d ON d.group_id = w.group_id
+              WHERE m.id = ANY(w.message_ids)
+                AND d.id <> ALL($1)
           )
         "#,
     )

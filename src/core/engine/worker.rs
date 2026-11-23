@@ -174,18 +174,11 @@ async fn finish(
             continue;
         }
         if let Some(index) = row.first_hit {
-            let (state, ids) = {
-                let context = &hits[index];
-                let refs: Vec<&Message> = context.iter().collect();
-                let state = lines(&refs, row.message_row_id);
-                let ids: Vec<i64> = context.iter().map(|message| message.row_id).collect();
-                (state, ids)
-            };
+            let refs: Vec<&Message> = hits[index].iter().collect();
+            let state = lines(&refs, row.message_row_id);
             row.completed_now = match decisions.score(&state).await {
                 Ok((action, categories)) => {
-                    decisions
-                        .mark_ready(row.id, action, &categories, Some(&ids))
-                        .await?
+                    decisions.mark_ready(row.id, action, &categories).await?
                 }
                 Err(err @ AppError::Provider(_)) => {
                     decisions.mark_failed(row.id, &err.to_string()).await?
@@ -196,7 +189,7 @@ async fn finish(
             row.completed_now = decisions.mark_failed(row.id, &failure).await?;
         } else {
             row.completed_now = decisions
-                .mark_ready(row.id, Action::Allow, &zero_scores(), None)
+                .mark_ready(row.id, Action::Allow, &zero_scores())
                 .await?;
         }
         row.pending = false;
