@@ -39,30 +39,44 @@ async fn session(mut socket: WebSocket, engine: Engine, metrics: Metrics, tenant
     loop {
         tokio::select! {
             frame = socket.recv() => {
-                let Some(frame) = frame else {
-                    break;
-                };
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        tracing::debug!(error = %err, "websocket closed");
-                        break;
-                    }
-                };
-                if !handle_frame(&mut socket, &engine, &tenant_id, &reply, frame).await {
+                if !read_frame(&mut socket, &engine, &tenant_id, &reply, frame).await {
                     break;
                 }
             }
             decision = decisions.recv() => {
-                let Some(decision) = decision else {
-                    break;
-                };
-                if !send_json(&mut socket, &decision).await {
+                if !forward_decision(&mut socket, decision).await {
                     break;
                 }
             }
         }
     }
+}
+
+async fn read_frame(
+    socket: &mut WebSocket,
+    engine: &Engine,
+    tenant_id: &str,
+    reply: &SocketSender,
+    frame: Option<Result<Message, axum::Error>>,
+) -> bool {
+    let Some(frame) = frame else {
+        return false;
+    };
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(err) => {
+            tracing::debug!(error = %err, "websocket closed");
+            return false;
+        }
+    };
+    handle_frame(socket, engine, tenant_id, reply, frame).await
+}
+
+async fn forward_decision(socket: &mut WebSocket, decision: Option<Decision>) -> bool {
+    let Some(decision) = decision else {
+        return false;
+    };
+    send_json(socket, &decision).await
 }
 
 async fn handle_frame(

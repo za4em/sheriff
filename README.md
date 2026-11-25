@@ -36,6 +36,8 @@ Send `Authorization: Bearer $SHERIFF_API_KEY` on every call.
 
 A message that could not be scored uses the same fields. `status` is `failed`, `action` and `categories` are null, and `error` says why.
 
+Sheriff asks one set of questions about each window of messages. It scores a message on its own only when a window that contains that message hits a category. `SHERIFF_MESSAGES_WINDOW` defaults to 30. `SHERIFF_BATCH_OVERLAP` defaults to half of that window.
+
 ## Save, then get the decision later
 
 `POST /v1/messages` takes the same JSON and returns `202`. The decision is stored. Sending the same `message_id` again stores another message and another decision, so a retry after a timeout can duplicate work. Register a webhook and Sheriff posts each finished decision there, including a decision that failed.

@@ -8,6 +8,7 @@ pub struct Config {
     pub(crate) provider: ProviderConfig,
     pub(crate) api_key: String,
     pub(crate) window: i64,
+    pub(crate) overlap: i64,
     pub(crate) threshold: f64,
     pub(crate) workers: usize,
     pub(crate) queue_url: String,
@@ -27,6 +28,7 @@ pub(crate) struct DatabaseConfig {
 impl Config {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
         let workers = workers()?;
+        let window = window()?;
         Ok(Self {
             server: ServerConfig {
                 bind_address: "0.0.0.0:3000".to_owned(),
@@ -37,7 +39,8 @@ impl Config {
             },
             provider: provider(workers)?,
             api_key: required("SHERIFF_API_KEY")?,
-            window: window()?,
+            window,
+            overlap: overlap(window)?,
             threshold: threshold()?,
             workers,
             queue_url: required("QUEUE_URL")?,
@@ -81,12 +84,31 @@ fn threshold() -> Result<f64, Box<dyn Error>> {
 }
 
 fn window() -> Result<i64, Box<dyn Error>> {
-    let raw = var_or("SHERIFF_MESSAGES_WINDOW", "50");
+    let raw = var_or("SHERIFF_MESSAGES_WINDOW", "30");
     let value: i64 = raw
         .parse()
         .map_err(|_| "SHERIFF_MESSAGES_WINDOW must be a number".to_owned())?;
     if value <= 0 {
         return Err("SHERIFF_MESSAGES_WINDOW must be greater than 0".into());
+    }
+    Ok(value)
+}
+
+fn overlap(window: i64) -> Result<i64, Box<dyn Error>> {
+    let Some(raw) = env::var("SHERIFF_BATCH_OVERLAP")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(window / 2);
+    };
+    let value: i64 = raw
+        .parse()
+        .map_err(|_| "SHERIFF_BATCH_OVERLAP must be a number".to_owned())?;
+    if value < 0 {
+        return Err("SHERIFF_BATCH_OVERLAP must be at least 0".into());
+    }
+    if value >= window {
+        return Err("SHERIFF_BATCH_OVERLAP must be less than SHERIFF_MESSAGES_WINDOW".into());
     }
     Ok(value)
 }

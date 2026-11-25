@@ -1,8 +1,8 @@
 ---- MODULE WebhookClaim ----
 \* One retained decision, two workers, two Sheriff instances.
 \*
-\* ReadPending     worker.rs run: decisions.get, status is still pending
-\* ReadDone        worker.rs run: decisions.get, status is already ready, publish false
+\* ReadPending     worker.rs score_group: group load, this decision is still pending
+\* ReadDone        worker.rs score_group: group load, this decision already left pending, publish false
 \* MarkReady       decisions/repository.rs mark_ready: UPDATE ... WHERE status = pending
 \* Publish         cache.rs ready_decision: XADD sheriff.ready with completed_now
 \* Observe         cache/reader.rs: each instance reads the stream (not a consumer group)

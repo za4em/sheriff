@@ -6,6 +6,7 @@
 //! give each id to only one instance.
 
 use redis::aio::ConnectionManager;
+use redis::streams::StreamMaxlen;
 use tokio::sync::mpsc;
 
 use crate::error::{AppError, cache as failed};
@@ -64,7 +65,7 @@ impl Cache {
         let _: Option<String> = redis::AsyncCommands::xadd_maxlen(
             &mut connection,
             READY,
-            redis::streams::StreamMaxlen::Approx(self.limit),
+            StreamMaxlen::Approx(self.limit),
             "*",
             &[
                 ("decision_id", decision_id),

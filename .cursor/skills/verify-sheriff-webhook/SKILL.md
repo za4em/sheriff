@@ -14,12 +14,12 @@ The check is a TLA+ model of that handoff, run with TLC from `tla2tools` 1.7.4. 
 Run it when a change edits any of these:
 
 - `src/core/engine.rs` `observe`, `claim_webhook`, `webhook`
-- `src/core/engine/worker.rs` `run`
+- `src/core/engine/worker.rs` `score_group`
 - `src/core/decisions/repository.rs` `mark_ready`
 - `src/core/cache.rs` `ready_decision`, `claim_webhook`
 - `src/core/cache/reader.rs` `follow_decisions`
 
-The model was last confirmed against commit `76aec26b78f29e9b40f590a9b316a02e81003469`. If one of those functions changed after that commit, the model may be stale. Do not move the commit forward until you have read the new code, updated the model if a step changed, and this check passes. A passing run on a stale model is not a pass for the new code.
+The model was last confirmed against commit `31c1dddb1f2ca23df1208e986beec81736e93a12`. If one of those functions changed after that commit, the model may be stale. Do not move the commit forward until you have read the new code, updated the model if a step changed, and this check passes. A passing run on a stale model is not a pass for the new code.
 
 ## Run
 
@@ -37,8 +37,8 @@ A passing run prints two lines: the claim holds for the faithful model, and the 
 
 Each action is one await in the Rust, not a whole request.
 
-- `ReadPending` is `decisions.get` in `worker.rs` `run` while `status` is `Pending`.
-- `ReadDone` is that same get after another worker has already left `Pending`. The worker will publish `completed_now` false.
+- `ReadPending` is the group load in `worker.rs` `score_group` while this decision's `status` is `Pending`.
+- `ReadDone` is that load after this decision has left `Pending`. The worker publishes `completed_now` false.
 - `MarkReady` is `mark_ready`: `UPDATE decisions SET status = ready WHERE id = $1 AND status = pending`. At most one worker gets `true`.
 - `Publish` is `cache.ready_decision`, an `XADD` on `sheriff.ready`.
 - `Observe` is one instance reading the next stream entry. Every instance has its own cursor. This is not a Redis consumer group.
@@ -74,10 +74,10 @@ It does not cover:
 
 | Action | Code |
 |---|---|
-| `ReadPending`, `ReadDone`, `Publish` | `src/core/engine/worker.rs` `run` |
+| `ReadPending`, `ReadDone`, `Publish` | `src/core/engine/worker.rs` `score_group` |
 | `MarkReady` | `src/core/decisions/repository.rs` `mark_ready` |
 | `Observe` | `src/core/cache/reader.rs` `follow_decisions` |
 | `Claim` | `src/core/cache.rs` `claim_webhook` |
 | `Post` | `src/core/engine.rs` `observe`, `webhook` |
 
-Sync commit: `76aec26b78f29e9b40f590a9b316a02e81003469`.
+Sync commit: `fb68f7da1baeab44e7ec4072fd71f08b8fb7a996`.

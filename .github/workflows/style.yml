@@ -1,0 +1,15 @@
+name: style
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust-style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust style
+        run: python3 scripts/rust_style.py
+      - name: rust style fixtures
+        run: python3 scripts/rust_style.py --self-test

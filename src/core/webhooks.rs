@@ -3,6 +3,7 @@ mod repository;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
+use reqwest::header::CONTENT_TYPE;
 use serde::Serialize;
 use sha2::Sha256;
 use sqlx::PgPool;
@@ -78,7 +79,7 @@ impl Webhooks {
             .http
             .post(&endpoint.url)
             .header(SIGNATURE, signature)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json")
             .body(body.to_vec())
             .send()
             .await

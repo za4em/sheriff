@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt::{self, Display};
 
 use axum::{
@@ -45,7 +46,7 @@ impl Display for AppError {
     }
 }
 
-impl std::error::Error for AppError {}
+impl Error for AppError {}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {

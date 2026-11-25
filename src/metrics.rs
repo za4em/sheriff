@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use prometheus::core::Collector;
 use prometheus::{
     Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
@@ -66,7 +67,7 @@ impl Metrics {
             "Open websocket connections.",
         )?;
         for metric in [
-            Box::new(http_duration.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(http_duration.clone()) as Box<dyn Collector>,
             Box::new(decisions.clone()),
             Box::new(provider_duration.clone()),
             Box::new(queue_depth.clone()),

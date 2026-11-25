@@ -15,6 +15,11 @@ const FAILED: &str = "failed";
 
 pub(crate) type CategoryScores = BTreeMap<Category, f64>;
 
+pub(crate) enum WindowVerdict {
+    Clean,
+    Hit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
@@ -29,6 +34,8 @@ pub(crate) struct Decision {
     #[serde(skip_serializing)]
     pub(crate) id: i64,
     #[serde(skip_serializing)]
+    pub(crate) group_id: String,
+    #[serde(skip_serializing)]
     #[sqlx(rename = "tenant_id")]
     pub(crate) tenant: String,
     #[serde(skip_serializing)]
@@ -41,16 +48,9 @@ pub(crate) struct Decision {
     #[sqlx(json(nullable))]
     pub(crate) categories: Option<CategoryScores>,
     pub(crate) error: Option<String>,
-    #[serde(skip_serializing)]
-    pub(crate) context: Vec<i64>,
 }
 
-pub(crate) struct MessageWithContext {
-    pub(crate) message_row_id: i64,
-    pub(crate) context: Vec<i64>,
-}
-
-pub(crate) use repository::insert_pending;
+pub(crate) use repository::{insert_pending, insert_windows};
 
 #[derive(Clone)]
 pub(crate) struct Decisions {
@@ -82,6 +82,14 @@ impl Decisions {
         repository::stale_pending(&self.pool, seconds, limit).await
     }
 
+    pub(crate) async fn group(&self, group_id: &str) -> Result<Vec<Decision>, AppError> {
+        repository::group(&self.pool, group_id).await
+    }
+
+    pub(crate) async fn windows(&self, group_id: &str) -> Result<Vec<Vec<i64>>, AppError> {
+        repository::windows(&self.pool, group_id).await
+    }
+
     pub(crate) async fn score(&self, state: &str) -> Result<(Action, CategoryScores), AppError> {
         let questions = message_questions();
         let started = Instant::now();
@@ -91,6 +99,20 @@ impl Decisions {
         let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
         let chosen = category::action(&hits(&categories, self.threshold));
         Ok((chosen, categories))
+    }
+
+    pub(crate) async fn judge_window(&self, state: &str) -> Result<WindowVerdict, AppError> {
+        let questions = batch_questions();
+        let started = Instant::now();
+        let decided = self.provider.decide(state, &questions).await;
+        self.metrics.observe_provider(started.elapsed());
+        let probabilities = decided.map_err(AppError::Provider)?;
+        let categories = category_scores(&probabilities).map_err(AppError::Provider)?;
+        if hits(&categories, self.threshold).is_empty() {
+            Ok(WindowVerdict::Clean)
+        } else {
+            Ok(WindowVerdict::Hit)
+        }
     }
 
     pub(crate) async fn mark_ready(
@@ -168,6 +190,13 @@ fn message_questions() -> Questions {
     Category::ALL
         .into_iter()
         .map(|category| (category.key(), Question::score(category.question())))
+        .collect()
+}
+
+fn batch_questions() -> Questions {
+    Category::ALL
+        .into_iter()
+        .map(|category| (category.key(), Question::score(category.batch_question())))
         .collect()
 }
 

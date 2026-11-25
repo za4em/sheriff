@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::AppError;
 
@@ -82,9 +83,39 @@ impl Category {
         }
     }
 
+    pub(crate) fn batch_question(self) -> &'static str {
+        match self {
+            Self::Insult => {
+                "Does this chat contain a direct attack on a person (name-calling or humiliation)? Profanity with no target does not count."
+            }
+            Self::Bullying => "Does this chat contain bullying? A single insult does not count.",
+            Self::Grooming => {
+                "Does this chat contain grooming (trust, secrecy, gifts, other apps, or photos with a likely minor)? One friendly message does not count."
+            }
+            Self::Hate => {
+                "Does this chat attack someone based on a protected group (ethnicity, religion, gender, orientation, or disability)?"
+            }
+            Self::Threat => {
+                "Does this chat threaten violence or harm, including finding someone or swatting?"
+            }
+            Self::Scam => {
+                "Does this chat contain a phishing link, a fake giveaway, or a request for credentials or codes?"
+            }
+            Self::IllegalActivity => {
+                "Does this chat sell or solicit drugs, weapons, stolen accounts, cheats, fake documents, or a call to commit a crime?"
+            }
+            Self::Doxxing => {
+                "Does this chat share someone else's personal information, or threaten to?"
+            }
+            Self::Spam => {
+                "Does this chat contain advertising, self-promotion, a referral link, or an invite to another server?"
+            }
+        }
+    }
+
     pub(crate) fn key(self) -> String {
         match serde_json::to_value(self) {
-            Ok(serde_json::Value::String(name)) => name,
+            Ok(Value::String(name)) => name,
             other => panic!("a category serializes as a string, got {other:?}"),
         }
     }
